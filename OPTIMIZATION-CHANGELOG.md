@@ -125,3 +125,35 @@ aws lambda update-function-code --function-name neptune-etl-from-aws \
 aws lambda update-function-code --function-name neptune-etl-from-cfn \
   --zip-file fileb:///tmp/etl_cfn.zip --region ap-northeast-1
 ```
+
+---
+
+## 2026-02-22 代码审查修复（小乖乖）
+
+**操作**：代码审查 + bug 修复 + 部署
+
+### 修复列表
+
+| # | 文件 | 类型 | 描述 |
+|---|------|------|------|
+| 1 | neptune_etl_deepflow.py | 🔴 Bug | 新增 `get_aws_session()` 辅助函数（3 处调用但未定义，运行必 NameError 崩溃） |
+| 2 | neptune_etl_deepflow.py | 🔴 性能 | `_get_creds()` 全局缓存 FrozenCredentials，避免每次 neptune_query 重建 boto3 Session |
+| 3 | neptune_etl_deepflow.py | 🟡 清理 | 删除 `batch_upsert_edges` 中构建但从未使用的 `parts` 列表及无效分批逻辑 |
+| 4 | neptune_etl_deepflow.py | 🟡 性能 | 抽取 `_get_eks_k8s_session()` 公共函数，`build_ip_service_map` 与 `fetch_replica_counts` 共享，消除重复 EKS API 调用 |
+| 5 | neptune_etl_cfn.py | 🟡 兼容 | `extract_ref_or_getatt` 返回类型 `str \| None` → `Optional[str]`（Python 3.9 兼容） |
+| 6 | neptune_etl_cfn.py | 🟡 清理 | 删除 `upsert_cfn_edge` 中计算但从未执行的第一个 `gremlin` 变量 |
+| 7 | neptune_etl_aws.py | 🟢 清理 | 删除 `get_vertex_id_after_upsert` 未使用的死函数 |
+| 8 | neptune_etl_aws.py | 🟢 清理 | 删除 `fetch_lambda_cloudwatch_metrics_batch` 未使用的 `lambda_client` 参数 |
+
+### 部署结果
+
+| 函数名 | 包大小 | 更新时间 |
+|--------|--------|----------|
+| neptune-etl-from-deepflow | 575,812 B | 2026-02-22T15:22:42Z |
+| neptune-etl-from-aws | 581,296 B | 2026-02-22T15:22:44Z |
+| neptune-etl-from-cfn | 1,350,431 B | 2026-02-22T15:22:45Z |
+
+### Git 提交
+
+- 仓库：`/home/ubuntu/tech/graph-dp-cdk`（首次初始化）
+- Commit：`ffc5bf3` - "fix: ETL Lambda 代码优化与 bug 修复 (2026-02-22)"
