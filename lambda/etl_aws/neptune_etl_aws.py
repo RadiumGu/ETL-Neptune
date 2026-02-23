@@ -306,15 +306,18 @@ def collect_ec2_instances(ec2_client) -> list:
                 instance_id = inst['InstanceId']
                 tags = inst.get('Tags', [])
                 name = next((t['Value'] for t in tags if t['Key'] == 'Name'), instance_id)
+                # EKS 节点标记：有 eks: 前缀的 tag
+                is_eks_node = any(t['Key'].startswith('eks:') for t in tags)
                 nodes.append({
                     'id': instance_id,
                     'name': name,
                     'instance_type': inst.get('InstanceType', ''),
                     'az': inst.get('Placement', {}).get('AvailabilityZone', ''),
                     'private_ip': inst.get('PrivateIpAddress', ''),
-                    'private_dns': inst.get('PrivateDnsName', ''),  # ContainerInsights NodeName
+                    'private_dns': inst.get('PrivateDnsName', ''),  # ContainerInsights NodeName（仅EKS）
                     'subnet_id': inst.get('SubnetId', ''),
                     'managed_by': resolve_managed_by(tags),
+                    'is_eks_node': is_eks_node,
                 })
     logger.info(f"EC2 instances: {len(nodes)}")
     return nodes
@@ -700,16 +703,45 @@ def get_cloudwatch_metric(cw_client, namespace, metric_name, dimensions, stat, p
         logger.warning(f"CW {namespace}/{metric_name}: {e}")
         return -1.0
 
+def discover_cwagent_disk_dims(cw_client, instances: list) -> dict:
+    """探测非 EKS 实例的 CWAgent disk_used_percent 维度（根分区 path='/'）。
+    返回 {instance_id: [dim_list]} 只包含有数据的实例。"""
+    result = {}
+    for inst in instances:
+        iid = inst['id']
+        try:
+            r = cw_client.list_metrics(
+                Namespace='CWAgent',
+                MetricName='disk_used_percent',
+                Dimensions=[
+                    {'Name': 'InstanceId', 'Value': iid},
+                    {'Name': 'path', 'Value': '/'},
+                ]
+            )
+            if r.get('Metrics'):
+                result[iid] = r['Metrics'][0]['Dimensions']
+        except Exception as e:
+            logger.warning(f"discover_cwagent_disk_dims {iid}: {e}")
+    return result
+
+
 def fetch_ec2_cloudwatch_metrics_batch(cw_client, instances: list) -> dict:
     """批量查询所有 EC2 实例的 CW 指标。
-    - AWS/EC2 namespace: CPUUtilization, NetworkIn, NetworkOut（所有实例）
-    - ContainerInsights namespace: node_memory_utilization, node_filesystem_utilization
-      （EKS 节点，维度需要 InstanceId + NodeName + ClusterName）
+    - AWS/EC2: CPUUtilization, NetworkIn, NetworkOut（所有实例）
+    - ContainerInsights: node_memory_utilization, node_filesystem_utilization
+      （EKS 节点，维度 InstanceId + NodeName + ClusterName）
+    - CWAgent: mem_used_percent, disk_used_percent
+      （非 EKS 节点，安装了 CloudWatch Agent）
     """
     if not instances:
         return {}
     end_time = datetime.datetime.utcnow()
     start_time = end_time - datetime.timedelta(minutes=15)
+
+    # 预探测非 EKS 实例的 CWAgent 磁盘维度（list_metrics 代价很低）
+    non_eks_instances = [i for i in instances if not i.get('is_eks_node')]
+    cwagent_disk_dims = discover_cwagent_disk_dims(cw_client, non_eks_instances) if non_eks_instances else {}
+
     queries = []
     id_map = {}  # metric_id → (instance_id, metric_key)
     for inst in instances:
@@ -724,20 +756,34 @@ def fetch_ec2_cloudwatch_metrics_batch(cw_client, instances: list) -> dict:
             {'Id': f"netin_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'NetworkIn', 'Dimensions': dims}, 'Period': 300, 'Stat': 'Average'}},
             {'Id': f"netout_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'NetworkOut', 'Dimensions': dims}, 'Period': 300, 'Stat': 'Average'}},
         ]
-        # ContainerInsights: EKS 节点有 NodeName（PrivateDnsName），才加这两个查询
-        node_name = inst.get('private_dns', '')
-        if node_name:
-            ci_dims = [
-                {'Name': 'InstanceId', 'Value': iid},
-                {'Name': 'NodeName', 'Value': node_name},
-                {'Name': 'ClusterName', 'Value': EKS_CLUSTER_NAME},
-            ]
-            id_map[f"mem_{safe_id}"] = (iid, 'memory_util')
-            id_map[f"disk_{safe_id}"] = (iid, 'disk_util')
-            queries += [
-                {'Id': f"mem_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'ContainerInsights', 'MetricName': 'node_memory_utilization', 'Dimensions': ci_dims}, 'Period': 300, 'Stat': 'Average'}},
-                {'Id': f"disk_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'ContainerInsights', 'MetricName': 'node_filesystem_utilization', 'Dimensions': ci_dims}, 'Period': 300, 'Stat': 'Average'}},
-            ]
+        if inst.get('is_eks_node'):
+            # EKS 节点：ContainerInsights（需要 NodeName + ClusterName）
+            node_name = inst.get('private_dns', '')
+            if node_name:
+                ci_dims = [
+                    {'Name': 'InstanceId', 'Value': iid},
+                    {'Name': 'NodeName', 'Value': node_name},
+                    {'Name': 'ClusterName', 'Value': EKS_CLUSTER_NAME},
+                ]
+                id_map[f"mem_{safe_id}"] = (iid, 'memory_util')
+                id_map[f"disk_{safe_id}"] = (iid, 'disk_util')
+                queries += [
+                    {'Id': f"mem_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'ContainerInsights', 'MetricName': 'node_memory_utilization', 'Dimensions': ci_dims}, 'Period': 300, 'Stat': 'Average'}},
+                    {'Id': f"disk_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'ContainerInsights', 'MetricName': 'node_filesystem_utilization', 'Dimensions': ci_dims}, 'Period': 300, 'Stat': 'Average'}},
+                ]
+        else:
+            # 非 EKS 节点：CWAgent（需要 InstanceType）
+            inst_type = inst.get('instance_type', '')
+            if inst_type:
+                cwa_mem_dims = [
+                    {'Name': 'InstanceId', 'Value': iid},
+                    {'Name': 'InstanceType', 'Value': inst_type},
+                ]
+                id_map[f"cwmem_{safe_id}"] = (iid, 'memory_util')
+                queries.append({'Id': f"cwmem_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'CWAgent', 'MetricName': 'mem_used_percent', 'Dimensions': cwa_mem_dims}, 'Period': 300, 'Stat': 'Average'}})
+            if iid in cwagent_disk_dims:
+                id_map[f"cwdisk_{safe_id}"] = (iid, 'disk_util')
+                queries.append({'Id': f"cwdisk_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'CWAgent', 'MetricName': 'disk_used_percent', 'Dimensions': cwagent_disk_dims[iid]}, 'Period': 300, 'Stat': 'Average'}})
     results = {}  # instance_id → metrics dict
     try:
         for i in range(0, len(queries), 500):
@@ -751,12 +797,13 @@ def fetch_ec2_cloudwatch_metrics_batch(cw_client, instances: list) -> dict:
                 if iid not in results:
                     results[iid] = {}
                 results[iid][metric_key] = val
-        # 记录 ContainerInsights 结果
+        # 记录指标来源
         for inst in instances:
             iid = inst['id']
             mem = results.get(iid, {}).get('memory_util')
             if mem is not None and mem > 0:
-                logger.info(f"EC2 ContainerInsights {inst['id']}: memory={mem:.2f}% disk={results[iid].get('disk_util',-1):.2f}%")
+                src = 'ContainerInsights' if inst.get('is_eks_node') else 'CWAgent'
+                logger.info(f"EC2 {src} {inst['name']}: memory={mem:.2f}% disk={results[iid].get('disk_util',-1):.2f}%")
     except Exception as e:
         logger.warning(f"EC2 batch CW failed: {e}")
     # 转换单位，输出标准化 dict
