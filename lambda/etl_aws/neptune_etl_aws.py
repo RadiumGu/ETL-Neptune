@@ -1512,6 +1512,38 @@ def run_etl():
     stats['vertices'] += biz_stats.get('created', 0)
     stats['edges'] += biz_stats.get('edges', 0)
 
+    # =========================================================
+    # Step 14: ETL Lambda → NeptuneCluster WritesTo 关联
+    #   这 3 个 Lambda 是图数据库的数据管道，静态配置 WritesTo 边
+    #   managed_by='etl' 区分它们与 PetSite 业务 Lambda
+    # =========================================================
+    ETL_LAMBDA_NAMES = [
+        'neptune-etl-from-aws',
+        'neptune-etl-from-deepflow',
+        'neptune-etl-from-cfn',
+    ]
+    NEPTUNE_CLUSTER_NAME = 'petsite-neptune'
+    neptune_cluster_vid = neptune_query(
+        f"g.V().has('NeptuneCluster','name','{NEPTUNE_CLUSTER_NAME}').id()"
+    )['result']['data']['@value']
+    def _extract_vid(raw):
+        if not raw: return None
+        v = raw[0]
+        if isinstance(v, dict): return v.get('@value', str(v))
+        return str(v)
+    neptune_cluster_vid = _extract_vid(neptune_cluster_vid)
+    for etl_fn in ETL_LAMBDA_NAMES:
+        etl_vid_resp = neptune_query(
+            f"g.V().has('LambdaFunction','name','{etl_fn}').id()"
+        )['result']['data']['@value']
+        etl_vid = _extract_vid(etl_vid_resp)
+        if etl_vid:
+            # 标记为 etl managed
+            neptune_query(f"g.V('{etl_vid}').property(single,'managed_by','etl')")
+            if neptune_cluster_vid:
+                upsert_edge(etl_vid, neptune_cluster_vid, 'WritesTo', {'source': 'aws-etl'})
+                stats['edges'] += 1
+
     logger.info(f"=== neptune-etl-from-aws 完成: {stats} ===")
     return stats
 
