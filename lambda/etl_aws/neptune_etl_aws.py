@@ -761,14 +761,13 @@ def fetch_lambda_cloudwatch_metrics_batch(cw_client, fns: list) -> dict:
         fname = fn['name']
         safe_name = ''.join(c if c.isalnum() else '_' for c in fname)[:60]
         dims = [{'Name': 'FunctionName', 'Value': fname}]
-        # p99 Duration（ExtendedStatistics）
+        # p99 Duration（get_metric_data 里百分位用 Stat='p99'）
         id_map[f"dur_p99_{safe_name}"] = (fname, 'p99_duration_ms')
         id_map[f"inv_{safe_name}"] = (fname, 'invocations')
         id_map[f"err_{safe_name}"] = (fname, 'errors')
         id_map[f"thr_{safe_name}"] = (fname, 'throttles')
         id_map[f"conc_{safe_name}"] = (fname, 'concurrent_executions')
         queries += [
-            # get_metric_data 里百分位用 Stat='p99' 而非 ExtendedStatistic
             {'Id': f"dur_p99_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Duration', 'Dimensions': dims}, 'Period': 900, 'Stat': 'p99'}},
             {'Id': f"inv_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Invocations', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Sum'}},
             {'Id': f"err_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Errors', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Sum'}},
