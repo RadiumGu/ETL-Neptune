@@ -67,6 +67,8 @@ FAULT_BOUNDARY_MAP = {
     'ECRRepository':    ('region', REGION),
     'StepFunction':     ('region', REGION),
     'RDSCluster':       ('region', REGION),    # 集群跨 AZ
+    'NeptuneCluster':   ('region', REGION),    # 图数据库集群，跨 AZ
+    'NeptuneInstance':  ('az',     None),      # 图数据库实例绑定单个 AZ
     'Region':           ('region', REGION),
 }
 
@@ -1330,14 +1332,16 @@ def run_etl():
                 stats['edges'] += 1
 
     # =========================================================
-    # Step 8: RDS / Aurora（NEW）
+    # Step 8: RDS / Aurora + Neptune
     # =========================================================
     rds_clusters = collect_rds_clusters(rds_client)
     rds_instances = collect_rds_instances(rds_client)
     rds_cluster_vid_map = {}
 
     for cluster in rds_clusters:
-        c_vid = upsert_vertex('RDSCluster', cluster['id'], {
+        is_neptune = cluster['engine'] == 'neptune'
+        vertex_label = 'NeptuneCluster' if is_neptune else 'RDSCluster'
+        c_vid = upsert_vertex(vertex_label, cluster['id'], {
             'arn': cluster['arn'],
             'engine': cluster['engine'],
             'engine_version': cluster['engine_version'],
@@ -1352,8 +1356,10 @@ def run_etl():
             stats['edges'] += 1
 
     for inst in rds_instances:
+        is_neptune = inst['engine'] == 'neptune'
+        vertex_label = 'NeptuneInstance' if is_neptune else 'RDSInstance'
         role = 'writer' if inst['is_writer'] else 'reader'
-        i_vid = upsert_vertex('RDSInstance', inst['id'], {
+        i_vid = upsert_vertex(vertex_label, inst['id'], {
             'arn': inst['arn'],
             'engine': inst['engine'],
             'instance_class': inst['instance_class'],
