@@ -108,8 +108,8 @@ BUSINESS_CAPABILITIES = [
         'name':              'PetInventoryManagement',
         'description':       '宠物库存状态异步管理（领养后更新可用性）',
         'recovery_priority': 'Tier1',
-        'serves_services':   ['petstatusupdater'],
-        'serves_lambda':     ['petstatusupdater'],
+        'serves_services':   [],                    # petstatusupdater 是 Lambda，不是 K8s 微服务
+        'serves_lambda':     ['petstatusupdater'],  # 模糊匹配 Lambda 函数名
         'depends_on_types':  ['DynamoDBTable', 'SQSQueue'],
     },
     {
@@ -551,7 +551,7 @@ def collect_rds_instances(rds_client) -> list:
     return instances
 
 def collect_sqs_queues(sqs_client) -> list:
-    """采集 SQS 队列（SQS 无 AZ 概念，是 region 级服务）"""
+    """采集 SQS 队列，并通过 RedrivePolicy 精准识别 DLQ→主队列关系"""
     queues = []
     try:
         paginator = sqs_client.get_paginator('list_queues')
@@ -562,7 +562,8 @@ def collect_sqs_queues(sqs_client) -> list:
                     attrs = sqs_client.get_queue_attributes(
                         QueueUrl=url,
                         AttributeNames=['QueueArn', 'ApproximateNumberOfMessages',
-                                        'VisibilityTimeout', 'MessageRetentionPeriod']
+                                        'VisibilityTimeout', 'MessageRetentionPeriod',
+                                        'RedrivePolicy', 'RedriveAllowPolicy']
                     ).get('Attributes', {})
                     try:
                         tags_resp = sqs_client.list_queue_tags(QueueUrl=url)
@@ -570,12 +571,23 @@ def collect_sqs_queues(sqs_client) -> list:
                     except Exception:
                         managed_by = 'manual'
                     is_dlq = 'dlq' in queue_name.lower() or 'dead' in queue_name.lower()
+                    # 解析 RedrivePolicy（DLQ 上的属性，指向主队列 ARN）
+                    redrive_target_arn = None
+                    redrive_raw = attrs.get('RedrivePolicy', '')
+                    if redrive_raw:
+                        try:
+                            import json as _json
+                            rp = _json.loads(redrive_raw)
+                            redrive_target_arn = rp.get('deadLetterTargetArn')
+                        except Exception:
+                            pass
                     queues.append({
                         'name': queue_name,
                         'url': url,
                         'arn': attrs.get('QueueArn', ''),
                         'is_dlq': str(is_dlq),
                         'managed_by': managed_by,
+                        'redrive_target_arn': redrive_target_arn,  # DLQ→主队列的 ARN
                     })
                 except Exception as e:
                     logger.warning(f"SQS queue {queue_name} attrs failed: {e}")
@@ -907,13 +919,67 @@ def upsert_business_capabilities() -> dict:
             continue
         stats['created'] += 1
 
-        # Serves → Microservice
+        # DependsOn → 基础设施节点（Python 端过滤 CDK 内部资源）
+        # CDK 内部资源特征：名字含 provider/waiter/framework 或是 ARN 格式
+        INTERNAL_KEYWORDS = ('provider', 'waiter', 'framework', 'customresource',
+                              'arn:aws:', 'iscompl', 'onevent', 'ontimeout')
+        for dep_label in cap.get('depends_on_types', []):
+            dl = safe_str(dep_label)
+            # 先在 Python 中拉出所有该 label 的节点，过滤后再创建边
+            try:
+                r_nodes = neptune_query(
+                    f"g.V().hasLabel('{dl}').project('id','name').by(id()).by(values('name')).toList()"
+                )
+                node_list = r_nodes.get('result', {}).get('data', {}).get('@value', [])
+                for node_item in node_list:
+                    node_vals = {}
+                    nv = node_item.get('@value', []) if isinstance(node_item, dict) else []
+                    for i in range(0, len(nv), 2):
+                        k = nv[i]; v = nv[i+1]
+                        if isinstance(v, dict) and '@value' in v:
+                            vl = v['@value']; v = vl[0] if vl else ''
+                            if isinstance(v, dict) and '@value' in v: v = v['@value']
+                        node_vals[k] = str(v)
+                    node_id = node_vals.get('id', '')
+                    node_name = node_vals.get('name', '').lower()
+                    # 跳过 CDK 内部节点
+                    if any(kw in node_name for kw in INTERNAL_KEYWORDS):
+                        logger.debug(f"DependsOn skip CDK-internal: {node_name}")
+                        continue
+                    if not node_id:
+                        continue
+                    try:
+                        neptune_query(
+                            f"g.V('{cap_vid}').as('cap').V('{node_id}')"
+                            f".coalesce("
+                            f"  __.inE('DependsOn').where(__.outV().hasId('{cap_vid}')),"
+                            f"  __.addE('DependsOn').from('cap')"
+                            f").property('source','business-layer').property('last_updated',{ts})"
+                        )
+                        stats['edges'] += 1
+                    except Exception as e:
+                        logger.debug(f"DependsOn edge {cap_name}→{node_name}: {e}")
+            except Exception as e:
+                logger.warning(f"DependsOn query {cap_name}→{dep_label}: {e}")
+
+        # Serves → Microservice（主动 upsert 节点，不依赖 DeepFlow 是否采集过）
         for svc_name in cap.get('serves_services', []):
             sn = safe_str(svc_name)
+            # 确保 Microservice 节点存在（从 etl_aws 写入，DeepFlow 可能还没采集到）
+            svc_vid = upsert_vertex('Microservice', sn, {
+                'namespace': 'default',
+                'source': 'business-layer',
+                'fault_boundary': 'az',
+                'region': REGION,
+                'recovery_priority': cap.get('recovery_priority', 'Tier2'),
+            }, 'manual')
+            if not svc_vid:
+                logger.debug(f"Microservice upsert failed: {sn}")
+                continue
             try:
                 neptune_query(
                     f"g.V('{cap_vid}').as('cap')"
-                    f".V().has('Microservice','name','{sn}')"
+                    f".V('{svc_vid}')"
                     f".coalesce("
                     f"  __.inE('Serves').where(__.outV().hasId('{cap_vid}')),"
                     f"  __.addE('Serves').from('cap')"
@@ -923,13 +989,13 @@ def upsert_business_capabilities() -> dict:
             except Exception as e:
                 logger.debug(f"Serves edge {cap_name}→Microservice({svc_name}) skip: {e}")
 
-        # Serves → LambdaFunction
-        for fn_name in cap.get('serves_lambda', []):
-            fn = safe_str(fn_name)
+        # Serves → LambdaFunction（按名字模糊匹配，因为 Lambda 名含随机后缀）
+        for fn_pattern in cap.get('serves_lambda', []):
+            fp = safe_str(fn_pattern)
             try:
                 neptune_query(
                     f"g.V('{cap_vid}').as('cap')"
-                    f".V().has('LambdaFunction','name','{fn}')"
+                    f".V().hasLabel('LambdaFunction').filter(__.values('name').containing('{fp}'))"
                     f".coalesce("
                     f"  __.inE('Serves').where(__.outV().hasId('{cap_vid}')),"
                     f"  __.addE('Serves').from('cap')"
@@ -937,23 +1003,7 @@ def upsert_business_capabilities() -> dict:
                 )
                 stats['edges'] += 1
             except Exception as e:
-                logger.debug(f"Serves edge {cap_name}→Lambda({fn_name}) skip: {e}")
-
-        # DependsOn → 基础设施节点（按 label 找第一个匹配的）
-        for dep_label in cap.get('depends_on_types', []):
-            dl = safe_str(dep_label)
-            try:
-                neptune_query(
-                    f"g.V('{cap_vid}').as('cap')"
-                    f".V().hasLabel('{dl}')"
-                    f".coalesce("
-                    f"  __.inE('DependsOn').where(__.outV().hasId('{cap_vid}')),"
-                    f"  __.addE('DependsOn').from('cap')"
-                    f").property('source','business-layer').property('last_updated',{ts})"
-                )
-                stats['edges'] += 1
-            except Exception as e:
-                logger.debug(f"DependsOn edge {cap_name}→{dep_label} skip: {e}")
+                logger.debug(f"Serves edge {cap_name}→Lambda({fn_pattern}) skip: {e}")
 
     logger.info(f"BusinessCapability: created={stats['created']}, edges={stats['edges']}")
     return stats
@@ -1031,12 +1081,9 @@ def run_etl():
         }, inst['managed_by'])
         inst_vid_map[inst['id']] = inst_vid
         stats['vertices'] += 1
-        # 顺手维护 AZ 节点
-        az_vid, _ = upsert_az_region(inst['az'])
-        # EC2 → AZ: LocatedIn
-        if inst_vid and az_vid:
-            upsert_edge(inst_vid, az_vid, 'LocatedIn', {'source': 'aws-etl'})
-            stats['edges'] += 1
+        # 顺手维护 AZ 节点（upsert AZ/Region，但不直接连 EC2→AZ 边）
+        # EC2 只连到 Subnet（Subnet 已经 LocatedIn AZ，可以通过两步遍历推出 AZ，避免冗余）
+        upsert_az_region(inst['az'])
         # EC2 → Subnet: LocatedIn
         if inst['subnet_id'] in subnet_vid_map:
             sn_vid = subnet_vid_map[inst['subnet_id']]
@@ -1064,12 +1111,12 @@ def run_etl():
             'arn': eks_cluster['arn'],
         }, 'cloudformation')
         stats['vertices'] += 1
-        # EKS 节点 → BelongsTo EKSCluster
+        # EC2 Instance → BelongsTo EKSCluster（EC2 属于 EKS，方向：EC2→EKSCluster）
         eks_instance_ids = collect_eks_nodegroup_instances(eks_client, ec2_client)
         for inst_id in eks_instance_ids:
             inst_vid = inst_vid_map.get(inst_id)
             if cluster_vid and inst_vid:
-                upsert_edge(cluster_vid, inst_vid, 'BelongsTo', {'source': 'aws-etl'})
+                upsert_edge(inst_vid, cluster_vid, 'BelongsTo', {'source': 'aws-etl'})
                 stats['edges'] += 1
 
     # =========================================================
@@ -1171,6 +1218,30 @@ def run_etl():
                     })
                     stats['edges'] += 1
 
+    # Lambda → Lambda: Invokes（通过 env var 引用另一个 Lambda 的 ARN 或名称）
+    # Fix: 之前 env var 匹配没有区分 Lambda ARN，错误创建了 AccessesData 边
+    fn_name_set = {fn['name'] for fn in lambda_fns}
+    fn_arn_to_name = {fn['arn']: fn['name'] for fn in lambda_fns}
+    for fn in lambda_fns:
+        fn_vid = fn_vid_map.get(fn['name'])
+        if not fn_vid:
+            continue
+        for var_name, var_val in fn.get('env_vars', {}).items():
+            if not isinstance(var_val, str):
+                continue
+            target_name = None
+            if ':function:' in var_val:
+                # 是 Lambda ARN，提取函数名或查 ARN map
+                clean_arn = var_val.rstrip(':*').rstrip(':')
+                target_name = fn_arn_to_name.get(clean_arn) or clean_arn.split(':')[-1]
+            elif var_val in fn_name_set and var_val != fn['name']:
+                target_name = var_val
+            if target_name and target_name in fn_vid_map and target_name != fn['name']:
+                upsert_edge(fn_vid, fn_vid_map[target_name], 'Invokes', {
+                    'source': 'aws-etl', 'evidence': f'env:{var_name}'
+                })
+                stats['edges'] += 1
+
     # =========================================================
     # Step 7: Step Functions
     # =========================================================
@@ -1258,14 +1329,19 @@ def run_etl():
             stats['edges'] += 1
 
     # SQS DLQ → 主队列: DeadLetterOf
+    # RedrivePolicy 在主队列上，指向 DLQ 的 ARN
+    # 边方向：DLQ →DeadLetterOf→ MainQueue（表示"此队列是谁的死信队列"）
     for q in sqs_queues:
-        if q['is_dlq'] == 'True':
-            main_name = q['name'].lower().replace('dlq', '').replace('deadletter', '').replace('dead-letter', '').strip('-_')
-            for other in sqs_queues:
-                if other['name'] != q['name'] and main_name and main_name in other['name'].lower():
-                    if sqs_vid_map.get(q['name']) and sqs_vid_map.get(other['name']):
-                        upsert_edge(sqs_vid_map[q['name']], sqs_vid_map[other['name']], 'DeadLetterOf', {'source': 'aws-etl'})
-                        stats['edges'] += 1
+        target_arn = q.get('redrive_target_arn')
+        if not target_arn:
+            continue
+        # q 是主队列，target_arn 是 DLQ 的 ARN
+        dlq_name = sqs_arn_to_name.get(target_arn)
+        if dlq_name and sqs_vid_map.get(dlq_name) and sqs_vid_map.get(q['name']):
+            upsert_edge(sqs_vid_map[dlq_name], sqs_vid_map[q['name']], 'DeadLetterOf',
+                        {'source': 'aws-etl'})
+            stats['edges'] += 1
+            logger.info(f"DeadLetterOf: {dlq_name} → {q['name']}")
 
     # Lambda → SQS: AccessesData（env var）
     for fn in lambda_fns:
