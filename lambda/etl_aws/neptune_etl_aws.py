@@ -768,7 +768,8 @@ def fetch_lambda_cloudwatch_metrics_batch(cw_client, fns: list) -> dict:
         id_map[f"thr_{safe_name}"] = (fname, 'throttles')
         id_map[f"conc_{safe_name}"] = (fname, 'concurrent_executions')
         queries += [
-            {'Id': f"dur_p99_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Duration', 'Dimensions': dims}, 'Period': 900, 'ExtendedStatistic': 'p99'}},
+            # get_metric_data 里百分位用 Stat='p99' 而非 ExtendedStatistic
+            {'Id': f"dur_p99_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Duration', 'Dimensions': dims}, 'Period': 900, 'Stat': 'p99'}},
             {'Id': f"inv_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Invocations', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Sum'}},
             {'Id': f"err_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Errors', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Sum'}},
             {'Id': f"thr_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Throttles', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Sum'}},
