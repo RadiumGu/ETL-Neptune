@@ -38,6 +38,89 @@ NEPTUNE_ENDPOINT = os.environ.get('NEPTUNE_ENDPOINT',
 NEPTUNE_PORT = int(os.environ.get('NEPTUNE_PORT', '8182'))
 REGION = os.environ.get('REGION', 'ap-northeast-1')
 EKS_CLUSTER_NAME = os.environ.get('EKS_CLUSTER_NAME', 'PetSite')
+ENVIRONMENT = os.environ.get('ENVIRONMENT', 'prod')
+
+# ===== AWS 服务故障边界（Fault Boundary）=====
+#
+# 故障边界表示：当该 AWS 服务发生故障时，影响的最小隔离域。
+# SRE 查询「哪些服务在同一故障域」时，遍历相同 fault_boundary + scope 的节点即可。
+#
+#  az:     故障影响单个 AZ（EC2、RDS Instance、Subnet 都绑定物理机架/数据中心）
+#  region: 服务是 region 级冗余，单 AZ 故障不影响服务本身
+#          但如果整个 region 宕机，所有 region 级服务一起受影响
+#  global: 控制面是全局的（如 IAM、Route53），但实际影响范围复杂，保守标注
+#
+FAULT_BOUNDARY_MAP = {
+    # AZ 级
+    'EC2Instance':      ('az',     None),      # 物理机绑定单个 AZ
+    'RDSInstance':      ('az',     None),      # 数据库实例绑定单个 AZ
+    'Subnet':           ('az',     None),      # 子网属于单个 AZ
+    'AvailabilityZone': ('az',     None),
+    # Region 级
+    'LambdaFunction':   ('region', REGION),    # Lambda 跨 AZ 自动分布
+    'EKSCluster':       ('region', REGION),    # control plane 是 regional
+    'LoadBalancer':     ('region', REGION),    # ALB 跨多 AZ
+    'DynamoDBTable':    ('region', REGION),    # regional + multi-AZ replication
+    'SQSQueue':         ('region', REGION),    # regional redundant
+    'SNSTopic':         ('region', REGION),
+    'S3Bucket':         ('region', REGION),    # 桶属于 region（全局 API 另说）
+    'ECRRepository':    ('region', REGION),
+    'StepFunction':     ('region', REGION),
+    'RDSCluster':       ('region', REGION),    # 集群跨 AZ
+    'Region':           ('region', REGION),
+}
+
+# ===== PetSite 恢复优先级配置 =====
+# 基于 PetSite 代码分析（宠物领养商店）
+LAMBDA_RECOVERY_PRIORITY = {
+    'petstatusupdater':   'Tier1',   # SQS 驱动的宠物状态更新
+    'cleanup':            'Tier2',   # 清理 Lambda
+    'guardduty':          'Tier2',   # 安全审计 Lambda
+    'cloudwatch-custom':  'Tier2',   # CW 自定义 Widget Lambda
+    'dynamodb-query':     'Tier2',   # DynamoDB 查询辅助 Lambda
+}
+
+EC2_RECOVERY_PRIORITY = {
+    # deepflow-server 是关键观测基础设施
+    'deepflow':           'Tier1',
+}
+
+# ===== 业务能力层配置（BusinessCapability 节点）=====
+# 宠物商店三条核心业务链路
+BUSINESS_CAPABILITIES = [
+    {
+        'name':              'PetAdoptionFlow',
+        'description':       '宠物领养核心流程：浏览→搜索→支付→状态更新',
+        'recovery_priority': 'Tier0',
+        'serves_services':   ['petsite', 'petsearch', 'payforadoption'],
+        'serves_lambda':     [],
+        'depends_on_types':  ['DynamoDBTable', 'SQSQueue', 'SNSTopic', 'StepFunction', 'RDSCluster'],
+    },
+    {
+        'name':              'AdoptionHistoryView',
+        'description':       '领养历史记录查询与展示',
+        'recovery_priority': 'Tier1',
+        'serves_services':   ['petlistadoptions', 'petadoptionshistory'],
+        'serves_lambda':     [],
+        'depends_on_types':  ['RDSCluster'],
+    },
+    {
+        'name':              'PetInventoryManagement',
+        'description':       '宠物库存状态异步管理（领养后更新可用性）',
+        'recovery_priority': 'Tier1',
+        'serves_services':   ['petstatusupdater'],
+        'serves_lambda':     ['petstatusupdater'],
+        'depends_on_types':  ['DynamoDBTable', 'SQSQueue'],
+    },
+    {
+        'name':              'PetFoodService',
+        'description':       '宠物食品信息服务',
+        'recovery_priority': 'Tier2',
+        'serves_services':   ['petfood'],
+        'serves_lambda':     [],
+        'depends_on_types':  [],
+    },
+]
 
 # ===== 全局 Session（避免每次 neptune_query 重建 credential）=====
 _frozen_creds = None
@@ -105,9 +188,19 @@ def upsert_vertex(label: str, name: str, extra_props: dict, managed_by: str = 'm
     """upsert 节点，返回 vertex ID 并写入缓存"""
     n = safe_str(name)
     mb = safe_str(managed_by)
+    # 全局注入 environment
+    all_props = {'environment': ENVIRONMENT}
+    # 按 label 自动注入 fault_boundary 和 region（故障边界信息）
+    fb_entry = FAULT_BOUNDARY_MAP.get(label)
+    if fb_entry:
+        fb_type, fb_region = fb_entry
+        all_props['fault_boundary'] = fb_type
+        if fb_region:
+            all_props['region'] = fb_region
+    all_props.update(extra_props)  # extra_props 优先（允许覆盖，如 RDS 实例显式传 az）
     props_create = f"'name': '{n}', 'managedBy': '{mb}', 'source': 'aws-etl'"
-    props_match = f"'managedBy': '{mb}', 'last_updated': {int(time.time())}"
-    for k, v in extra_props.items():
+    props_match = f"'managedBy': '{mb}', 'last_updated': {int(time.time())}, 'environment': '{ENVIRONMENT}'"
+    for k, v in all_props.items():
         ks = safe_str(k)
         vs = safe_str(v)
         props_create += f", '{ks}': '{vs}'"
@@ -595,7 +688,7 @@ def get_cloudwatch_metric(cw_client, namespace, metric_name, dimensions, stat, p
         return -1.0
 
 def fetch_ec2_cloudwatch_metrics_batch(cw_client, instances: list) -> dict:
-    """批量查询所有 EC2 实例的 CW 指标（一次 API 调用）"""
+    """批量查询所有 EC2 实例的 CW 指标（含 CloudWatch Agent: memory_util/disk_util）"""
     if not instances:
         return {}
     end_time = datetime.datetime.utcnow()
@@ -608,11 +701,18 @@ def fetch_ec2_cloudwatch_metrics_batch(cw_client, instances: list) -> dict:
         id_map[f"cpu_{safe_id}"] = (iid, 'cpu_util_avg')
         id_map[f"netin_{safe_id}"] = (iid, 'network_in_bytes')
         id_map[f"netout_{safe_id}"] = (iid, 'network_out_bytes')
+        id_map[f"mem_{safe_id}"] = (iid, 'memory_util')
+        id_map[f"disk_{safe_id}"] = (iid, 'disk_util')
         dims = [{'Name': 'InstanceId', 'Value': iid}]
+        dims_mem = [{'Name': 'InstanceId', 'Value': iid}]
+        dims_disk = [{'Name': 'InstanceId', 'Value': iid}, {'Name': 'path', 'Value': '/'}]
         queries += [
             {'Id': f"cpu_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'CPUUtilization', 'Dimensions': dims}, 'Period': 300, 'Stat': 'Average'}},
             {'Id': f"netin_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'NetworkIn', 'Dimensions': dims}, 'Period': 300, 'Stat': 'Average'}},
             {'Id': f"netout_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'NetworkOut', 'Dimensions': dims}, 'Period': 300, 'Stat': 'Average'}},
+            # CloudWatch Agent 指标（需要 CWAgent namespace）
+            {'Id': f"mem_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'CWAgent', 'MetricName': 'mem_used_percent', 'Dimensions': dims_mem}, 'Period': 300, 'Stat': 'Average'}},
+            {'Id': f"disk_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'CWAgent', 'MetricName': 'disk_used_percent', 'Dimensions': dims_disk}, 'Period': 300, 'Stat': 'Average'}},
         ]
     results = {}  # instance_id → metrics dict
     try:
@@ -638,15 +738,19 @@ def fetch_ec2_cloudwatch_metrics_batch(cw_client, instances: list) -> dict:
         cpu = raw.get('cpu_util_avg', -1.0)
         net_in = raw.get('network_in_bytes', -1.0)
         net_out = raw.get('network_out_bytes', -1.0)
+        mem = raw.get('memory_util', -1.0)
+        disk = raw.get('disk_util', -1.0)
         out[iid] = {
             'cpu_util_avg': round(cpu, 2) if cpu >= 0 else -1.0,
             'network_in_mbps': round(net_in / 300 / 1024 / 1024 * 8, 4) if net_in >= 0 else -1.0,
             'network_out_mbps': round(net_out / 300 / 1024 / 1024 * 8, 4) if net_out >= 0 else -1.0,
+            'memory_util': round(mem, 2) if mem >= 0 else -1.0,
+            'disk_util': round(disk, 2) if disk >= 0 else -1.0,
         }
     return out
 
 def fetch_lambda_cloudwatch_metrics_batch(cw_client, fns: list) -> dict:
-    """批量查询所有 Lambda 函数的 CW 指标 + MemorySize"""
+    """批量查询所有 Lambda 函数的 CW 指标（p99_duration_ms + concurrent_executions）"""
     if not fns:
         return {}
     end_time = datetime.datetime.utcnow()
@@ -657,15 +761,18 @@ def fetch_lambda_cloudwatch_metrics_batch(cw_client, fns: list) -> dict:
         fname = fn['name']
         safe_name = ''.join(c if c.isalnum() else '_' for c in fname)[:60]
         dims = [{'Name': 'FunctionName', 'Value': fname}]
-        id_map[f"dur_{safe_name}"] = (fname, 'avg_duration_ms')
+        # p99 Duration（ExtendedStatistics）
+        id_map[f"dur_p99_{safe_name}"] = (fname, 'p99_duration_ms')
         id_map[f"inv_{safe_name}"] = (fname, 'invocations')
         id_map[f"err_{safe_name}"] = (fname, 'errors')
         id_map[f"thr_{safe_name}"] = (fname, 'throttles')
+        id_map[f"conc_{safe_name}"] = (fname, 'concurrent_executions')
         queries += [
-            {'Id': f"dur_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Duration', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Average'}},
+            {'Id': f"dur_p99_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Duration', 'Dimensions': dims}, 'Period': 900, 'ExtendedStatistic': 'p99'}},
             {'Id': f"inv_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Invocations', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Sum'}},
             {'Id': f"err_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Errors', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Sum'}},
             {'Id': f"thr_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'Throttles', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Sum'}},
+            {'Id': f"conc_{safe_name}", 'MetricStat': {'Metric': {'Namespace': 'AWS/Lambda', 'MetricName': 'ConcurrentExecutions', 'Dimensions': dims}, 'Period': 900, 'Stat': 'Average'}},
         ]
     raw_results = {}
     try:
@@ -692,15 +799,17 @@ def fetch_lambda_cloudwatch_metrics_batch(cw_client, fns: list) -> dict:
     for fn in fns:
         fname = fn['name']
         raw = raw_results.get(fname, {})
-        dur = raw.get('avg_duration_ms', -1.0)
+        p99_dur = raw.get('p99_duration_ms', -1.0)
         inv = raw.get('invocations', -1.0)
         err = raw.get('errors', -1.0)
         thr = raw.get('throttles', -1.0)
+        conc = raw.get('concurrent_executions', -1.0)
         out[fname] = {
-            'avg_duration_ms': round(dur, 2) if dur >= 0 else -1.0,
+            'p99_duration_ms': round(p99_dur, 2) if p99_dur >= 0 else -1.0,
             'error_rate': round(err / inv, 4) if inv > 0 and err >= 0 else -1.0,
             'throttle_rate': round(thr / inv, 4) if inv > 0 and thr >= 0 else -1.0,
             'invocations_per_min': round(inv / 30, 2) if inv >= 0 else -1.0,
+            'concurrent_executions': round(conc, 2) if conc >= 0 else -1.0,
             'memory_size_mb': fn_memory_map.get(fname, -1),
         }
     return out
@@ -710,7 +819,7 @@ def update_ec2_metrics(name, metrics):
         n = safe_str(name)
         ts = int(time.time())
         props = f".property('cw_updated_at', {ts})"
-        for key in ['cpu_util_avg', 'network_in_mbps', 'network_out_mbps']:
+        for key in ['cpu_util_avg', 'network_in_mbps', 'network_out_mbps', 'memory_util', 'disk_util']:
             props += f".property('{key}', {float(metrics.get(key, -1.0)):.4f})"
         neptune_query(f"g.V().has('EC2Instance', 'name', '{n}'){props}")
         return True
@@ -723,7 +832,7 @@ def update_lambda_metrics(name, metrics):
         n = safe_str(name)
         ts = int(time.time())
         props = f".property('cw_updated_at', {ts})"
-        for key in ['avg_duration_ms', 'error_rate', 'throttle_rate', 'invocations_per_min']:
+        for key in ['p99_duration_ms', 'error_rate', 'throttle_rate', 'invocations_per_min', 'concurrent_executions']:
             props += f".property('{key}', {float(metrics.get(key, -1.0)):.4f})"
         props += f".property('memory_size_mb', {int(metrics.get('memory_size_mb', -1))})"
         neptune_query(f"g.V().has('LambdaFunction', 'name', '{n}'){props}")
@@ -765,6 +874,90 @@ def extract_sfn_lambda_refs(definition_str, lambda_fns):
     except Exception as e:
         logger.warning(f"SFN definition parse failed: {e}")
     return list(set(refs))
+
+# ===== 业务能力层（BusinessCapability 节点）=====
+
+def upsert_business_capabilities() -> dict:
+    """
+    创建业务能力层节点（BusinessCapability），并连接到对应的技术服务。
+
+    边类型：
+      BusinessCapability → Microservice:  Serves（由哪些微服务提供支撑）
+      BusinessCapability → LambdaFunction: Serves
+      BusinessCapability → 基础设施节点:   DependsOn（依赖哪类基础设施，按 label 查找）
+
+    不依赖 vertex ID 硬编码，全部通过图遍历动态查找已存在的节点。
+    """
+    stats = {'created': 0, 'edges': 0}
+    ts = int(time.time())
+
+    for cap in BUSINESS_CAPABILITIES:
+        cap_name = safe_str(cap['name'])
+        priority = safe_str(cap['recovery_priority'])
+        desc = safe_str(cap['description'])
+
+        # upsert BusinessCapability 节点
+        cap_vid = upsert_vertex('BusinessCapability', cap_name, {
+            'description': desc,
+            'recovery_priority': priority,
+            'layer': 'business',
+        }, 'manual')
+        if not cap_vid:
+            logger.warning(f"BusinessCapability upsert failed: {cap_name}")
+            continue
+        stats['created'] += 1
+
+        # Serves → Microservice
+        for svc_name in cap.get('serves_services', []):
+            sn = safe_str(svc_name)
+            try:
+                neptune_query(
+                    f"g.V('{cap_vid}').as('cap')"
+                    f".V().has('Microservice','name','{sn}')"
+                    f".coalesce("
+                    f"  __.inE('Serves').where(__.outV().hasId('{cap_vid}')),"
+                    f"  __.addE('Serves').from('cap')"
+                    f").property('source','business-layer').property('last_updated',{ts})"
+                )
+                stats['edges'] += 1
+            except Exception as e:
+                logger.debug(f"Serves edge {cap_name}→Microservice({svc_name}) skip: {e}")
+
+        # Serves → LambdaFunction
+        for fn_name in cap.get('serves_lambda', []):
+            fn = safe_str(fn_name)
+            try:
+                neptune_query(
+                    f"g.V('{cap_vid}').as('cap')"
+                    f".V().has('LambdaFunction','name','{fn}')"
+                    f".coalesce("
+                    f"  __.inE('Serves').where(__.outV().hasId('{cap_vid}')),"
+                    f"  __.addE('Serves').from('cap')"
+                    f").property('source','business-layer').property('last_updated',{ts})"
+                )
+                stats['edges'] += 1
+            except Exception as e:
+                logger.debug(f"Serves edge {cap_name}→Lambda({fn_name}) skip: {e}")
+
+        # DependsOn → 基础设施节点（按 label 找第一个匹配的）
+        for dep_label in cap.get('depends_on_types', []):
+            dl = safe_str(dep_label)
+            try:
+                neptune_query(
+                    f"g.V('{cap_vid}').as('cap')"
+                    f".V().hasLabel('{dl}')"
+                    f".coalesce("
+                    f"  __.inE('DependsOn').where(__.outV().hasId('{cap_vid}')),"
+                    f"  __.addE('DependsOn').from('cap')"
+                    f").property('source','business-layer').property('last_updated',{ts})"
+                )
+                stats['edges'] += 1
+            except Exception as e:
+                logger.debug(f"DependsOn edge {cap_name}→{dep_label} skip: {e}")
+
+    logger.info(f"BusinessCapability: created={stats['created']}, edges={stats['edges']}")
+    return stats
+
 
 # ===== 主 ETL 逻辑 =====
 
@@ -823,11 +1016,18 @@ def run_etl():
     ec2_instances = collect_ec2_instances(ec2_client)
     inst_vid_map = {}  # instance_id → vid
     for inst in ec2_instances:
+        # 按 Name tag 匹配恢复优先级
+        priority = 'Tier2'
+        for key, p in EC2_RECOVERY_PRIORITY.items():
+            if key.lower() in inst['name'].lower():
+                priority = p
+                break
         inst_vid = upsert_vertex('EC2Instance', inst['name'], {
             'instance_id': inst['id'],
             'instance_type': inst['instance_type'],
             'az': inst['az'],
             'private_ip': inst['private_ip'],
+            'recovery_priority': priority,
         }, inst['managed_by'])
         inst_vid_map[inst['id']] = inst_vid
         stats['vertices'] += 1
@@ -919,9 +1119,16 @@ def run_etl():
     lambda_fns = collect_lambda_functions(lambda_client)
     fn_vid_map = {}
     for fn in lambda_fns:
+        # 按名称匹配恢复优先级
+        priority = 'Tier2'
+        for key, p in LAMBDA_RECOVERY_PRIORITY.items():
+            if key in fn['name'].lower():
+                priority = p
+                break
         fn_vid = upsert_vertex('LambdaFunction', fn['name'], {
             'arn': fn['arn'],
             'runtime': fn['runtime'],
+            'recovery_priority': priority,
         }, fn['managed_by'])
         fn_vid_map[fn['name']] = fn_vid
         stats['vertices'] += 1
@@ -1150,6 +1357,13 @@ def run_etl():
         if r_vid and region_vid:
             upsert_edge(r_vid, region_vid, 'LocatedIn', {'source': 'aws-etl'})
             stats['edges'] += 1
+
+    # =========================================================
+    # Step 13: 业务能力层节点（BusinessCapability）
+    # =========================================================
+    biz_stats = upsert_business_capabilities()
+    stats['vertices'] += biz_stats.get('created', 0)
+    stats['edges'] += biz_stats.get('edges', 0)
 
     logger.info(f"=== neptune-etl-from-aws 完成: {stats} ===")
     return stats

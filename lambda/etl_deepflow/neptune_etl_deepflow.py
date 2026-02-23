@@ -32,6 +32,25 @@ INTERVAL_MIN = int(os.environ.get('INTERVAL_MIN', '6'))
 EKS_CLUSTER_ARN = os.environ.get('EKS_CLUSTER_ARN',
     'arn:aws:eks:ap-northeast-1:926093770964:cluster/PetSite')
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
+ENVIRONMENT = os.environ.get('ENVIRONMENT', 'prod')
+
+# ===== PetSite 服务恢复优先级（基于代码分析）=====
+# Tier0: 核心收益路径，宕机直接影响用户无法领养宠物
+# Tier1: 重要功能，宕机导致体验降级但主流程仍可运行
+# Tier2: 辅助功能
+MICROSERVICE_RECOVERY_PRIORITY = {
+    # Tier0 - 核心领养流程
+    'petsite':           'Tier0',  # 前端入口，所有流量入口
+    'petsearch':         'Tier0',  # 宠物搜索/浏览，无此服务用户看不到宠物
+    'payforadoption':    'Tier0',  # 支付/领养事务处理，核心收益
+    # Tier1 - 重要但非阻塞
+    'petlistadoptions':  'Tier1',  # 领养列表展示，降级不影响主流程
+    'petadoptionshistory': 'Tier1', # 历史记录查询
+    'petstatusupdater':  'Tier1',  # 宠物状态异步更新（SQS驱动）
+    'petfood':           'Tier1',  # 宠物食品信息
+    # Tier2 - 辅助
+    'trafficgenerator':  'Tier2',  # 流量生成，非业务服务
+}
 
 # ===== Neptune 请求（复用 session）=====
 
@@ -104,15 +123,17 @@ def ch_query_json(sql: str) -> dict:
 # ===== L7 性能指标 =====
 
 def fetch_l7_metrics() -> dict:
+    # 注意：DeepFlow l7_flow_log 没有 server_ip 字段，服务端 IP 是 ip4_1
+    # response_status 是枚举(0=正常,1=异常,2=不存在,3=服务端异常,4=客户端异常)，不是 HTTP 状态码
     sql = """
-SELECT server_ip,
+SELECT IPv4NumToString(ip4_1) AS server_ip,
     quantile(0.5)(response_duration)/1000 AS p50_latency_ms,
     quantile(0.99)(response_duration)/1000 AS p99_latency_ms,
     count()/300 AS rps,
-    countIf(response_status >= 500)/count() AS error_rate
+    countIf(response_status >= 1) / count() AS error_rate
 FROM flow_log.l7_flow_log
-WHERE time > toUnixTimestamp(now()) - 300
-    AND response_duration > 0 AND server_ip != ''
+WHERE toUnixTimestamp(time) > toUnixTimestamp(now()) - 300
+    AND response_duration > 0 AND ip4_1 != 0
 GROUP BY server_ip
 """
     result = {}
@@ -130,6 +151,29 @@ GROUP BY server_ip
         logger.info(f"L7 metrics fetched for {len(result)} IPs")
     except Exception as e:
         logger.error(f"fetch_l7_metrics failed: {e}")
+    return result
+
+
+def fetch_active_connections() -> dict:
+    """从 network_map.1m 查 TCP 连接数（用 syn_count 代理活跃连接）"""
+    sql = """
+SELECT IPv4NumToString(ip4_1) AS server_ip,
+    sum(syn_count) AS active_connections
+FROM `flow_metrics`.`network_map.1m`
+WHERE toUnixTimestamp(time) > toUnixTimestamp(now()) - 300
+    AND ip4_1 != 0 AND protocol = 6
+GROUP BY server_ip
+"""
+    result = {}
+    try:
+        data = ch_query_json(sql)
+        for row in data.get('data', []):
+            ip = row.get('server_ip', '')
+            if ip:
+                result[ip] = int(float(row.get('active_connections', 0) or 0))
+        logger.info(f"active_connections fetched for {len(result)} IPs")
+    except Exception as e:
+        logger.error(f"fetch_active_connections failed: {e}")
     return result
 
 # ===== EKS Token & IP 映射 =====
@@ -203,6 +247,42 @@ def build_ip_service_map() -> dict:
             pass
     return ip_map
 
+def fetch_resource_limits(ip_map: dict) -> dict:
+    """从 K8s Deployments API 获取 resource limits，返回 {svc_name: {cpu, memory}}"""
+    resource_limits = {}
+    import requests
+    k8s_endpoint, token, ca_file = _get_eks_k8s_session()
+    if not k8s_endpoint:
+        return resource_limits
+    headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
+    try:
+        resp = requests.get(f"{k8s_endpoint}/apis/apps/v1/deployments",
+                            headers=headers, verify=ca_file, timeout=15)
+        if resp.status_code == 200:
+            for item in resp.json().get('items', []):
+                labels = item.get('metadata', {}).get('labels', {})
+                svc_name = (labels.get('app') or labels.get('app.kubernetes.io/name')
+                            or labels.get('name') or item.get('metadata', {}).get('name', ''))
+                containers = (item.get('spec', {}).get('template', {})
+                              .get('spec', {}).get('containers', []))
+                if containers and svc_name:
+                    limits = containers[0].get('resources', {}).get('limits', {})
+                    resource_limits[svc_name] = {
+                        'cpu': limits.get('cpu', ''),
+                        'memory': limits.get('memory', ''),
+                    }
+        logger.info(f"resource_limits fetched for {len(resource_limits)} services")
+    except Exception as e:
+        logger.warning(f"fetch_resource_limits failed: {e}")
+    finally:
+        try:
+            if ca_file:
+                os.unlink(ca_file)
+        except Exception:
+            pass
+    return resource_limits
+
+
 def fetch_replica_counts(ip_map: dict) -> dict:
     replica_map = {}
     import requests
@@ -242,11 +322,16 @@ def batch_upsert_nodes(services: list):
         parts = []
         for svc in batch:
             n, ns, ip = safe_str(svc['name']), safe_str(svc['namespace']), safe_str(svc['ip'])
+            priority = MICROSERVICE_RECOVERY_PRIORITY.get(n, 'Tier2')
             parts.append(
                 f"mergeV([(T.label): 'Microservice', 'name': '{n}'])"
                 f".option(Merge.onCreate, [(T.label): 'Microservice', 'name': '{n}', "
-                f"'namespace': '{ns}', 'ip': '{ip}', 'source': 'deepflow'])"
-                f".option(Merge.onMatch, ['ip': '{ip}', 'namespace': '{ns}'])"
+                f"'namespace': '{ns}', 'ip': '{ip}', 'source': 'deepflow', "
+                f"'environment': '{ENVIRONMENT}', 'recovery_priority': '{priority}', "
+                f"'fault_boundary': 'az', 'region': '{REGION}'])"
+                f".option(Merge.onMatch, ['ip': '{ip}', 'namespace': '{ns}', "
+                f"'environment': '{ENVIRONMENT}', 'recovery_priority': '{priority}', "
+                f"'fault_boundary': 'az'])"
             )
         gremlin = "g." + ".".join(parts)
         try:
@@ -257,11 +342,16 @@ def batch_upsert_nodes(services: list):
             for svc in batch:
                 try:
                     n, ns, ip = safe_str(svc['name']), safe_str(svc['namespace']), safe_str(svc['ip'])
+                    priority = MICROSERVICE_RECOVERY_PRIORITY.get(n, 'Tier2')
                     neptune_query(
                         f"g.mergeV([(T.label): 'Microservice', 'name': '{n}'])"
                         f".option(Merge.onCreate, [(T.label): 'Microservice', 'name': '{n}', "
-                        f"'namespace': '{ns}', 'ip': '{ip}', 'source': 'deepflow'])"
-                        f".option(Merge.onMatch, ['ip': '{ip}', 'namespace': '{ns}'])"
+                        f"'namespace': '{ns}', 'ip': '{ip}', 'source': 'deepflow', "
+                        f"'environment': '{ENVIRONMENT}', 'recovery_priority': '{priority}', "
+                        f"'fault_boundary': 'az', 'region': '{REGION}'])"
+                        f".option(Merge.onMatch, ['ip': '{ip}', 'namespace': '{ns}', "
+                        f"'environment': '{ENVIRONMENT}', 'recovery_priority': '{priority}', "
+                        f"'fault_boundary': 'az'])"
                     )
                 except Exception as e2:
                     logger.error(f"single upsert node {svc['name']} failed: {e2}")
@@ -272,6 +362,10 @@ def batch_upsert_edges(edges: list):
     for e in edges:
         src, dst = safe_str(e['src']), safe_str(e['dst'])
         proto = safe_str(e['protocol'])
+        calls = e['calls']
+        errors = e['errors']
+        error_rate = round(errors / calls, 4) if calls > 0 else 0.0
+        p99 = float(e.get('p99_latency_ms', -1))
         gremlin = (
             f"g.V().has('Microservice','name','{src}').as('s')"
             f".V().has('Microservice','name','{dst}')"
@@ -281,9 +375,11 @@ def batch_upsert_edges(edges: list):
             f")"
             f".property('protocol','{proto}')"
             f".property('port',{e['port']})"
-            f".property('calls',{e['calls']})"
+            f".property('calls',{calls})"
             f".property('avg_latency_us',{e['avg_latency']:.0f})"
-            f".property('error_count',{e['errors']})"
+            f".property('p99_latency_ms',{p99:.4f})"
+            f".property('error_count',{errors})"
+            f".property('error_rate',{error_rate})"
             f".property('active',true)"
             f".property('last_seen',{ts})"
         )
@@ -293,7 +389,8 @@ def batch_upsert_edges(edges: list):
             logger.error(f"upsert edge {e['src']}->{e['dst']} failed: {ex}")
 
 def batch_fetch_dependency_and_update(service_names: list, l7_metrics: dict,
-                                       ip_map_by_name: dict, replica_counts: dict):
+                                       ip_map_by_name: dict, replica_counts: dict,
+                                       resource_limits: dict, active_connections_map: dict):
     """合并 dependency 查询：每个服务 1 次请求（原来 4 次）+ 1 次 metrics 更新"""
     ts = int(time.time())
     for name in service_names:
@@ -329,11 +426,27 @@ def batch_fetch_dependency_and_update(service_names: list, l7_metrics: dict,
         # 构建 metrics
         svc_ip = ip_map_by_name.get(name, '')
         l7 = l7_metrics.get(svc_ip, {})
-        props = [f".property('metrics_updated_at',{ts})"]
+        priority = MICROSERVICE_RECOVERY_PRIORITY.get(name, 'Tier2')
+        props = [f".property('metrics_updated_at',{ts})",
+                 f".property('environment','{ENVIRONMENT}')",
+                 f".property('recovery_priority','{priority}')",
+                 f".property('fault_boundary','az')",
+                 f".property('region','{REGION}')"]
         for key in ['p50_latency_ms', 'p99_latency_ms', 'rps', 'error_rate']:
             v = l7.get(key, -1)
             props.append(f".property('{key}',{float(v):.4f})")
+        # active_connections（来自 network_map L4 数据）
+        ac = active_connections_map.get(svc_ip, -1)
+        props.append(f".property('active_connections',{int(ac)})")
         props.append(f".property('replica_count',{int(replica_counts.get(name, -1))})")
+        # K8s resource limits
+        limits = resource_limits.get(name, {})
+        if limits.get('cpu'):
+            cpu_s = safe_str(limits['cpu'])
+            props.append(f".property('resource_limit_cpu','{cpu_s}')")
+        if limits.get('memory'):
+            mem_s = safe_str(limits['memory'])
+            props.append(f".property('resource_limit_memory','{mem_s}')")
         for key in ['upstream_count', 'downstream_count']:
             props.append(f".property('{key}',{int(dep.get(key, -1))})")
         for key in ['is_entry_point', 'has_db_dependency', 'has_cache_dependency']:
@@ -356,14 +469,18 @@ def run_etl():
         logger.warning("Empty IP map, will use IP-based names as fallback")
 
     # 2. 查询 ClickHouse - L7 流量关系
+    # 注意：去掉 type=0 过滤（DeepFlow 中 type=2 是响应日志，占绝大多数有效数据）
+    # server_ip 用 ip4_1，error 用 response_status=3（服务端异常）
     sql = f"""
 SELECT IPv4NumToString(ip4_0) as src_ip, IPv4NumToString(ip4_1) as dst_ip,
     server_port, l7_protocol_str, count() as calls,
-    avg(response_duration) as avg_latency_us, countIf(response_status = 3) as error_count
+    avg(response_duration) as avg_latency_us,
+    countIf(response_status = 3) as error_count,
+    quantile(0.99)(response_duration)/1000 AS p99_latency_ms
 FROM flow_log.l7_flow_log
 WHERE ip4_0 != 0 AND ip4_1 != 0
-    AND time > now() - INTERVAL {INTERVAL_MIN} MINUTE
-    AND type = 0 AND ip4_0 != ip4_1
+    AND toUnixTimestamp(time) > toUnixTimestamp(now()) - {INTERVAL_MIN}*60
+    AND ip4_0 != ip4_1
 GROUP BY src_ip, dst_ip, server_port, l7_protocol_str
 HAVING calls >= 2
 ORDER BY calls DESC LIMIT 100 FORMAT TSV
@@ -373,6 +490,9 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
 
     # 3. L7 性能指标
     l7_metrics = fetch_l7_metrics()
+
+    # 3b. 活跃连接数（from network_map L4）
+    active_connections_map = fetch_active_connections()
 
     if not rows:
         logger.info("No flow data, skipping")
@@ -387,6 +507,7 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
         if len(row) < 7:
             continue
         src_ip, dst_ip, port, protocol, calls_s, avg_lat_s, errors_s = row[:7]
+        p99_ms = float(row[7]) if len(row) > 7 else -1.0
         try:
             calls, avg_lat, errors = int(calls_s), float(avg_lat_s), int(errors_s)
         except ValueError:
@@ -404,7 +525,8 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
         ip_map_by_name[dst_name] = dst_ip
         edges_list.append({
             'src': src_name, 'dst': dst_name, 'protocol': protocol,
-            'port': port, 'calls': calls, 'avg_latency': avg_lat, 'errors': errors,
+            'port': port, 'calls': calls, 'avg_latency': avg_lat,
+            'errors': errors, 'p99_latency_ms': p99_ms,
         })
 
     # 5. 批量写入节点
@@ -416,13 +538,15 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
     logger.info(f"upsert {len(edges_list)} 条边...")
     batch_upsert_edges(edges_list)
 
-    # 7. 副本数
+    # 7. 副本数 + resource limits
     replica_counts = fetch_replica_counts(ip_map)
+    resource_limits = fetch_resource_limits(ip_map)
 
     # 8. 合并 dependency 查询 + metrics 更新（每服务 2 次请求，原来 5 次）
     service_names = list(nodes_set.keys())
     logger.info(f"更新 {len(service_names)} 个服务的指标...")
-    batch_fetch_dependency_and_update(service_names, l7_metrics, ip_map_by_name, replica_counts)
+    batch_fetch_dependency_and_update(service_names, l7_metrics, ip_map_by_name,
+                                       replica_counts, resource_limits, active_connections_map)
 
     # 9. 验证
     try:
