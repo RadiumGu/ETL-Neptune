@@ -312,6 +312,7 @@ def collect_ec2_instances(ec2_client) -> list:
                     'instance_type': inst.get('InstanceType', ''),
                     'az': inst.get('Placement', {}).get('AvailabilityZone', ''),
                     'private_ip': inst.get('PrivateIpAddress', ''),
+                    'private_dns': inst.get('PrivateDnsName', ''),  # ContainerInsights NodeName
                     'subnet_id': inst.get('SubnetId', ''),
                     'managed_by': resolve_managed_by(tags),
                 })
@@ -700,35 +701,45 @@ def get_cloudwatch_metric(cw_client, namespace, metric_name, dimensions, stat, p
         return -1.0
 
 def fetch_ec2_cloudwatch_metrics_batch(cw_client, instances: list) -> dict:
-    """批量查询所有 EC2 实例的 CW 指标（含 CloudWatch Agent: memory_util/disk_util）"""
+    """批量查询所有 EC2 实例的 CW 指标。
+    - AWS/EC2 namespace: CPUUtilization, NetworkIn, NetworkOut（所有实例）
+    - ContainerInsights namespace: node_memory_utilization, node_filesystem_utilization
+      （EKS 节点，维度需要 InstanceId + NodeName + ClusterName）
+    """
     if not instances:
         return {}
     end_time = datetime.datetime.utcnow()
     start_time = end_time - datetime.timedelta(minutes=15)
     queries = []
-    id_map = {}  # metric_id → instance_id
+    id_map = {}  # metric_id → (instance_id, metric_key)
     for inst in instances:
         iid = inst['id']
         safe_id = iid.replace('-', '_')
         id_map[f"cpu_{safe_id}"] = (iid, 'cpu_util_avg')
         id_map[f"netin_{safe_id}"] = (iid, 'network_in_bytes')
         id_map[f"netout_{safe_id}"] = (iid, 'network_out_bytes')
-        id_map[f"mem_{safe_id}"] = (iid, 'memory_util')
-        id_map[f"disk_{safe_id}"] = (iid, 'disk_util')
         dims = [{'Name': 'InstanceId', 'Value': iid}]
-        dims_mem = [{'Name': 'InstanceId', 'Value': iid}]
-        dims_disk = [{'Name': 'InstanceId', 'Value': iid}, {'Name': 'path', 'Value': '/'}]
         queries += [
             {'Id': f"cpu_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'CPUUtilization', 'Dimensions': dims}, 'Period': 300, 'Stat': 'Average'}},
             {'Id': f"netin_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'NetworkIn', 'Dimensions': dims}, 'Period': 300, 'Stat': 'Average'}},
             {'Id': f"netout_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'AWS/EC2', 'MetricName': 'NetworkOut', 'Dimensions': dims}, 'Period': 300, 'Stat': 'Average'}},
-            # CloudWatch Agent 指标（需要 CWAgent namespace）
-            {'Id': f"mem_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'CWAgent', 'MetricName': 'mem_used_percent', 'Dimensions': dims_mem}, 'Period': 300, 'Stat': 'Average'}},
-            {'Id': f"disk_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'CWAgent', 'MetricName': 'disk_used_percent', 'Dimensions': dims_disk}, 'Period': 300, 'Stat': 'Average'}},
         ]
+        # ContainerInsights: EKS 节点有 NodeName（PrivateDnsName），才加这两个查询
+        node_name = inst.get('private_dns', '')
+        if node_name:
+            ci_dims = [
+                {'Name': 'InstanceId', 'Value': iid},
+                {'Name': 'NodeName', 'Value': node_name},
+                {'Name': 'ClusterName', 'Value': EKS_CLUSTER_NAME},
+            ]
+            id_map[f"mem_{safe_id}"] = (iid, 'memory_util')
+            id_map[f"disk_{safe_id}"] = (iid, 'disk_util')
+            queries += [
+                {'Id': f"mem_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'ContainerInsights', 'MetricName': 'node_memory_utilization', 'Dimensions': ci_dims}, 'Period': 300, 'Stat': 'Average'}},
+                {'Id': f"disk_{safe_id}", 'MetricStat': {'Metric': {'Namespace': 'ContainerInsights', 'MetricName': 'node_filesystem_utilization', 'Dimensions': ci_dims}, 'Period': 300, 'Stat': 'Average'}},
+            ]
     results = {}  # instance_id → metrics dict
     try:
-        # get_metric_data 最多 500 个 query
         for i in range(0, len(queries), 500):
             resp = cw_client.get_metric_data(MetricDataQueries=queries[i:i+500], StartTime=start_time, EndTime=end_time)
             for r in resp.get('MetricDataResults', []):
@@ -740,9 +751,15 @@ def fetch_ec2_cloudwatch_metrics_batch(cw_client, instances: list) -> dict:
                 if iid not in results:
                     results[iid] = {}
                 results[iid][metric_key] = val
+        # 记录 ContainerInsights 结果
+        for inst in instances:
+            iid = inst['id']
+            mem = results.get(iid, {}).get('memory_util')
+            if mem is not None and mem > 0:
+                logger.info(f"EC2 ContainerInsights {inst['id']}: memory={mem:.2f}% disk={results[iid].get('disk_util',-1):.2f}%")
     except Exception as e:
         logger.warning(f"EC2 batch CW failed: {e}")
-    # 转换单位
+    # 转换单位，输出标准化 dict
     out = {}
     for inst in instances:
         iid = inst['id']
@@ -830,9 +847,10 @@ def update_ec2_metrics(name, metrics):
     try:
         n = safe_str(name)
         ts = int(time.time())
-        props = f".property('cw_updated_at', {ts})"
+        # 使用 property(single,...) 确保覆盖而非追加（Neptune 默认 list cardinality）
+        props = f".property(single,'cw_updated_at',{ts})"
         for key in ['cpu_util_avg', 'network_in_mbps', 'network_out_mbps', 'memory_util', 'disk_util']:
-            props += f".property('{key}', {float(metrics.get(key, -1.0)):.4f})"
+            props += f".property(single,'{key}',{float(metrics.get(key, -1.0)):.4f})"
         neptune_query(f"g.V().has('EC2Instance', 'name', '{n}'){props}")
         return True
     except Exception as e:
@@ -843,10 +861,10 @@ def update_lambda_metrics(name, metrics):
     try:
         n = safe_str(name)
         ts = int(time.time())
-        props = f".property('cw_updated_at', {ts})"
+        props = f".property(single,'cw_updated_at',{ts})"
         for key in ['p99_duration_ms', 'error_rate', 'throttle_rate', 'invocations_per_min', 'concurrent_executions']:
-            props += f".property('{key}', {float(metrics.get(key, -1.0)):.4f})"
-        props += f".property('memory_size_mb', {int(metrics.get('memory_size_mb', -1))})"
+            props += f".property(single,'{key}',{float(metrics.get(key, -1.0)):.4f})"
+        props += f".property(single,'memory_size_mb',{int(metrics.get('memory_size_mb', -1))})"
         neptune_query(f"g.V().has('LambdaFunction', 'name', '{n}'){props}")
         return True
     except Exception as e:
