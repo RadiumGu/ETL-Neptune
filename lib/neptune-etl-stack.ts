@@ -94,6 +94,12 @@ export class NeptuneEtlStack extends cdk.Stack {
         'cloudwatch:GetMetricStatistics',
         'cloudwatch:GetMetricData',
         'cloudwatch:ListMetrics',
+        'cloudwatch:DescribeAlarms',
+        // Lambda Event Source（SQS trigger 映射）
+        'lambda:ListEventSourceMappings',
+        // Network Flow Monitor（EC2 网络 RTT/健康指标）
+        'networkflowmonitor:ListMonitors',
+        'networkflowmonitor:GetMonitor',
       ],
       resources: ['*'],
     }));
