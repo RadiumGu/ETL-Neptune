@@ -573,8 +573,12 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
         except ValueError:
             continue
 
-        src_info = ip_map.get(src_ip, {'name': f"svc-{src_ip.replace('.', '-')}", 'namespace': 'unknown'})
-        dst_info = ip_map.get(dst_ip, {'name': f"svc-{dst_ip.replace('.', '-')}", 'namespace': 'unknown'})
+        src_info = ip_map.get(src_ip)
+        dst_info = ip_map.get(dst_ip)
+        # 只处理 ip_map 中能解析的 IP（K8s 已知 pod/service）
+        # 未解析的 IP（旧 pod、外部服务等）直接跳过，避免产生 svc-x.x.x.x 幽灵节点
+        if not src_info or not dst_info:
+            continue
         src_name, dst_name = src_info['name'], dst_info['name']
         if src_name == dst_name:
             continue
