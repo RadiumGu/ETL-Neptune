@@ -594,35 +594,44 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
     logger.info(f"批量 upsert {len(nodes_list)} 个节点...")
     batch_upsert_nodes(nodes_list)
 
-    # 5b. 用 property(single,'az',...) 更新 az（mergeV onMatch dict 是 list cardinality，不能放里面）
-    # 从 ip_map 构建 service→主AZ 映射（同名服务取出现次数最多的 AZ）
-    from collections import Counter as _Counter
-    svc_az_counter: dict = {}
+    # 5b. 更新 az 属性（set cardinality，保留多 AZ 信息）
+    # 设计原则：Microservice 可能跨多 AZ 部署（多副本），az 应存所有实际 AZ 的集合
+    # 用 set cardinality：property(set,'az','az-1a') / property(set,'az','az-1c')
+    # 每次 ETL 先 drop 旧 az（反映当前真实部署），再写入本次 ip_map 中的 AZ
+    #
+    # 查询示例：az-1a 故障影响哪些服务？
+    #   g.V().hasLabel('Microservice').has('az','ap-northeast-1a').values('name')
+    # → 返回有 pod 在 1a 的所有服务（含多 AZ 部署的服务，如 petsite）
+
+    # 构建 service → {az1, az2, ...} 映射（从所有 pod 的 node_az 信息）
+    svc_azs_map: dict = {}  # service_name → set of azs
     for pod_ip, info in ip_map.items():
         sn = info['name']
         az_val = info.get('az', '')
         if az_val:
-            if sn not in svc_az_counter:
-                svc_az_counter[sn] = _Counter()
-            svc_az_counter[sn][az_val] += 1
-    svc_az_map = {
-        sn: counter.most_common(1)[0][0]
-        for sn, counter in svc_az_counter.items()
-        if counter
-    }
+            if sn not in svc_azs_map:
+                svc_azs_map[sn] = set()
+            svc_azs_map[sn].add(az_val)
+
     az_updated = 0
-    for sn, az_val in svc_az_map.items():
+    for sn, az_set in svc_azs_map.items():
         n = safe_str(sn)
-        az_s = safe_str(az_val)
         try:
+            # Step 1: drop 旧 az 属性（清除过期的 AZ 信息，如 pod 被重新调度到其他 AZ）
             neptune_query(
-                f"g.V().hasLabel('Microservice').has('name','{n}')"
-                f".property(single,'az','{az_s}')"
+                f"g.V().hasLabel('Microservice').has('name','{n}').properties('az').drop()"
             )
+            # Step 2: 逐一添加当前所有 AZ（set cardinality = 自动去重）
+            for az_val in az_set:
+                az_s = safe_str(az_val)
+                neptune_query(
+                    f"g.V().hasLabel('Microservice').has('name','{n}')"
+                    f".property(set,'az','{az_s}')"
+                )
             az_updated += 1
         except Exception as e:
             logger.error(f"Update az {sn}: {e}")
-    logger.info(f"az 属性更新完成: {az_updated} 个服务")
+    logger.info(f"az 属性更新完成: {az_updated} 个服务，az_sets={{{', '.join(f'{k}:{v}' for k,v in list(svc_azs_map.items())[:5])}}}")
 
     # 6. 写入边（复用连接，无需 get_vertex_id）
     logger.info(f"upsert {len(edges_list)} 条边...")
