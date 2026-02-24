@@ -235,12 +235,17 @@ def _get_eks_k8s_session() -> tuple:
         logger.warning(f"EKS session setup failed: {e}")
         return None, None, None
 
-def build_ip_service_map() -> dict:
+def build_ip_service_map() -> tuple:
+    """返回 (ip_map, ecr_dep_map)
+    ip_map:     {pod_ip: {'name':..., 'namespace':..., 'type':..., 'az':...}}
+    ecr_dep_map:{svc_name: set(ecr_repo_names)}  ← 启动依赖
+    """
     ip_map = {}
+    ecr_dep_map = {}
     import requests
     k8s_endpoint, token, ca_file = _get_eks_k8s_session()
     if not k8s_endpoint:
-        return ip_map
+        return ip_map, ecr_dep_map
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
     try:
         # Step 1: node_name → AZ 映射
@@ -294,13 +299,22 @@ def build_ip_service_map() -> dict:
                         'type': 'Microservice',
                         'az': az,
                     }
+                # ECR 启动依赖：提取 private ECR 镜像（不含 public.ecr.aws）
+                ecr_suffix = '.dkr.ecr.' + REGION + '.amazonaws.com/'
+                if svc_name:
+                    for ctr in (item.get('spec', {}).get('containers', []) +
+                                item.get('spec', {}).get('initContainers', [])):
+                        image = ctr.get('image', '')
+                        if ecr_suffix in image:
+                            repo = image.split(ecr_suffix)[-1].split(':')[0].split('@')[0]
+                            ecr_dep_map.setdefault(svc_name, set()).add(repo)
         logger.info(f"IP→Service map: {len(ip_map)} entries (with AZ info)")
     finally:
         try:
             os.unlink(ca_file)
         except Exception:
             pass
-    return ip_map
+    return ip_map, ecr_dep_map
 
 def fetch_resource_limits(ip_map: dict) -> dict:
     """从 K8s Deployments API 获取 resource limits，返回 {svc_name: {cpu, memory}}"""
@@ -529,7 +543,7 @@ def run_etl():
     t0 = time.time()
 
     # 1. 构建 IP→服务名映射
-    ip_map = build_ip_service_map()
+    ip_map, ecr_dep_map = build_ip_service_map()
     if not ip_map:
         logger.warning("Empty IP map, will use IP-based names as fallback")
 
@@ -680,6 +694,43 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
             logger.info(f"Microservice GC: 删除 {dropped} 个旧 K8s 原名节点")
     except Exception as e:
         logger.warning(f"Microservice GC failed (non-fatal): {e}")
+
+    # ECR 启动依赖写入（来自 build_ip_service_map 提取的镜像信息）
+    ecr_startup_count = 0
+    try:
+        ts_ecr = int(time.time())
+        ecr_sfx = '.dkr.ecr.' + REGION + '.amazonaws.com/'
+        for svc_name, ecr_repos in ecr_dep_map.items():
+            svc_vids = neptune_query(
+                f"g.V().hasLabel('Microservice').has('name','{safe_str(svc_name)}').id()"
+            ).get('result', {}).get('data', {}).get('@value', [])
+            if not svc_vids:
+                continue
+            svc_vid = svc_vids[0]
+            svc_vid = svc_vid.get('@value', svc_vid) if isinstance(svc_vid, dict) else svc_vid
+            for repo in ecr_repos:
+                ecr_vids = neptune_query(
+                    f"g.V().hasLabel('ECRRepository').has('name','{safe_str(repo)}').id()"
+                ).get('result', {}).get('data', {}).get('@value', [])
+                if not ecr_vids:
+                    continue
+                ecr_vid = ecr_vids[0]
+                ecr_vid = ecr_vid.get('@value', ecr_vid) if isinstance(ecr_vid, dict) else ecr_vid
+                neptune_query(
+                    f"g.V('{svc_vid}').as('s').V('{ecr_vid}')"
+                    f".coalesce("
+                    f"  __.inE('DependsOn').where(__.outV().hasId('{svc_vid}')),"
+                    f"  __.addE('DependsOn').from('s')"
+                    f").property('source','deepflow-etl')"
+                    f".property('phase','startup')"
+                    f".property('strength','strong')"
+                    f".property('last_updated',{ts_ecr})"
+                )
+                ecr_startup_count += 1
+        if ecr_startup_count:
+            logger.info(f"ECR startup deps: {ecr_startup_count} 条边写入")
+    except Exception as e:
+        logger.warning(f"ECR startup deps failed (non-fatal): {e}")
 
     duration = int((time.time() - t0) * 1000)
     logger.info(f"=== ETL 完成: nodes={len(nodes_list)}, edges={len(edges_list)}, {duration}ms ===")

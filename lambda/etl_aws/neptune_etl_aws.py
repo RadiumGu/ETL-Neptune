@@ -93,6 +93,15 @@ MICROSERVICE_RECOVERY_PRIORITY = {
     'trafficgenerator':    'Tier2',
 }
 
+# K8s pod app label → Neptune 微服务名别名（与 etl_deepflow 保持一致）
+K8S_SERVICE_ALIAS = {
+    'pay-for-adoption': 'payforadoption',
+    'list-adoptions':   'petlistadoptions',
+    'search-service':   'petsearch',
+    'pethistory':       'pethistory',
+    'traffic-generator': 'trafficgenerator',
+}
+
 EC2_RECOVERY_PRIORITY = {
     # deepflow-server 是关键观测基础设施
     'deepflow':           'Tier1',
@@ -1037,7 +1046,10 @@ def upsert_business_capabilities() -> dict:
                             f".coalesce("
                             f"  __.inE('DependsOn').where(__.outV().hasId('{cap_vid}')),"
                             f"  __.addE('DependsOn').from('cap')"
-                            f").property('source','business-layer').property('last_updated',{ts})"
+                            f").property('source','business-layer')"
+                            f".property('phase','runtime')"
+                            f".property('strength','strong')"
+                            f".property('last_updated',{ts})"
                         )
                         stats['edges'] += 1
                     except Exception as e:
@@ -1091,6 +1103,122 @@ def upsert_business_capabilities() -> dict:
 
     logger.info(f"BusinessCapability: created={stats['created']}, edges={stats['edges']}")
     return stats
+
+
+# ===== K8s 连接工具（用于 ECR 启动依赖扫描）=====
+
+def _get_eks_token(cluster_name: str, session) -> str:
+    """生成 EKS Kubernetes API bearer token（AWS STS presigned URL 方式）"""
+    try:
+        import botocore
+        from botocore.signers import RequestSigner
+        signer = RequestSigner(
+            botocore.model.ServiceId('sts'), REGION, 'sts', 'v4',
+            session.get_credentials(), session.events,
+        )
+        params = {
+            'method': 'GET',
+            'url': f'https://sts.{REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15',
+            'body': {}, 'headers': {'x-k8s-aws-id': cluster_name}, 'context': {},
+        }
+        signed = signer.generate_presigned_url(params, region_name=REGION, expires_in=60, operation_name='')
+        import base64
+        token = 'k8s-aws-v1.' + base64.urlsafe_b64encode(signed.encode()).rstrip(b'=').decode()
+        return token
+    except Exception as e:
+        logger.warning(f"EKS token failed: {e}")
+        return ''
+
+
+def scan_ecr_startup_deps(eks_client, session) -> int:
+    """扫描 EKS pod 的 container image，提取 ECR 依赖，写入 DependsOn(phase=startup) 边
+    返回写入的边数量。非阻断性（异常仅记录）。
+    """
+    count = 0
+    try:
+        cluster_info = eks_client.describe_cluster(name=EKS_CLUSTER_NAME)
+        k8s_endpoint = cluster_info['cluster']['endpoint']
+        ca_data = cluster_info['cluster']['certificateAuthority']['data']
+        token = _get_eks_token(EKS_CLUSTER_NAME, session)
+        if not token:
+            logger.warning("scan_ecr_startup_deps: EKS token unavailable")
+            return 0
+
+        import base64 as b64, tempfile, requests as req_lib
+        ca_bytes = b64.b64decode(ca_data)
+        with tempfile.NamedTemporaryFile(suffix='.crt', delete=False) as f:
+            f.write(ca_bytes)
+            ca_file = f.name
+
+        headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
+        resp = req_lib.get(
+            f'{k8s_endpoint}/api/v1/pods?fieldSelector=metadata.namespace%3Ddefault',
+            headers=headers, verify=ca_file, timeout=3
+        )
+        if resp.status_code != 200:
+            logger.warning(f"K8s pods API {resp.status_code}")
+            return 0
+
+        # 解析 pod → 容器镜像 → ECR repo 名
+        # 镜像格式：ACCOUNT.dkr.ecr.REGION.amazonaws.com/REPO[:TAG][@sha256:...]
+        ecr_suffix = '.dkr.ecr.' + REGION + '.amazonaws.com/'
+        svc_ecr_map: dict = {}  # svc_name → set of ecr_repo_names
+        for pod in resp.json().get('items', []):
+            labels = pod.get('metadata', {}).get('labels', {})
+            app_label = (labels.get('app') or labels.get('app.kubernetes.io/name') or
+                         labels.get('name') or '')
+            svc_name = K8S_SERVICE_ALIAS.get(app_label, app_label) if app_label else ''
+            if not svc_name:
+                continue
+            for container in (pod.get('spec', {}).get('containers', []) +
+                               pod.get('spec', {}).get('initContainers', [])):
+                image = container.get('image', '')
+                if ecr_suffix in image:
+                    # 提取 repo name（去掉 TAG/SHA 部分）
+                    repo_part = image.split(ecr_suffix)[-1].split(':')[0].split('@')[0]
+                    if svc_name not in svc_ecr_map:
+                        svc_ecr_map[svc_name] = set()
+                    svc_ecr_map[svc_name].add(repo_part)
+
+        logger.info(f"ECR startup deps: {len(svc_ecr_map)} 服务有 ECR 依赖")
+
+        # 写 Microservice → DependsOn(phase=startup) → ECRRepository 边
+        ts = int(time.time())
+        for svc_name, ecr_repos in svc_ecr_map.items():
+            svc_vids = neptune_query(
+                f"g.V().hasLabel('Microservice').has('name','{safe_str(svc_name)}').id().fold()"
+            )['result']['data']['@value']
+            if not svc_vids or not svc_vids[0].get('@value'):
+                continue
+            svc_vid = svc_vids[0]['@value'][0]
+            if isinstance(svc_vid, dict): svc_vid = svc_vid.get('@value', svc_vid)
+
+            for repo in ecr_repos:
+                ecr_vids = neptune_query(
+                    f"g.V().hasLabel('ECRRepository').has('name','{safe_str(repo)}').id().fold()"
+                )['result']['data']['@value']
+                if not ecr_vids or not ecr_vids[0].get('@value'):
+                    logger.debug(f"ECR repo not found in graph: {repo}")
+                    continue
+                ecr_vid = ecr_vids[0]['@value'][0]
+                if isinstance(ecr_vid, dict): ecr_vid = ecr_vid.get('@value', ecr_vid)
+
+                neptune_query(
+                    f"g.V('{svc_vid}').as('s').V('{ecr_vid}')"
+                    f".coalesce("
+                    f"  __.inE('DependsOn').where(__.outV().hasId('{svc_vid}')),"
+                    f"  __.addE('DependsOn').from('s')"
+                    f").property('source','aws-etl')"
+                    f".property('phase','startup')"
+                    f".property('strength','strong')"
+                    f".property('last_updated',{ts})"
+                )
+                count += 1
+                logger.debug(f"ECR dep: {svc_name} -[DependsOn(startup)]-> {repo}")
+
+    except Exception as e:
+        logger.warning(f"scan_ecr_startup_deps failed (non-fatal): {e}", exc_info=True)
+    return count
 
 
 # ===== 主 ETL 逻辑 =====
