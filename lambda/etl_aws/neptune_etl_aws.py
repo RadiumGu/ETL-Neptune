@@ -1570,49 +1570,146 @@ def run_etl():
                 stats['edges'] += 1
 
     # =========================================================
-    # Step 15: GC — 清理已终止的 EC2Instance 节点
-    #   ETL 只做 upsert，不自动删除。节点组缩容后，已终止的 EC2
-    #   会永远留在图里成为"幽灵节点"，影响爆炸半径分析准确性。
-    #   每次 ETL 结尾与 AWS 真实状态对比，删掉已不存在的节点。
+    # Step 15: GC — 全量资源类型幽灵节点清理
+    #   ETL 只做 upsert，不自动删除。资源删除后会永远留在图里
+    #   影响爆炸半径分析准确性。每次 ETL 结尾与 AWS 真实状态
+    #   对比，删掉已不存在的节点（非阻断性，异常仅记录）。
     # =========================================================
-    try:
-        # 从 Neptune 取所有 EC2Instance 的 instance_id
-        gc_resp = neptune_query(
-            "g.V().hasLabel('EC2Instance').project('vid','iid').by(id()).by(values('instance_id')).fold()"
-        )['result']['data']['@value']
-        graph_ec2 = {}  # instance_id → vertex id
-        if gc_resp:
-            for item in gc_resp[0].get('@value', []):
+    def _gc_vertices(label: str, id_prop: str, aws_ids: set) -> int:
+        """通用幽灵节点清理：把图里 label 类型节点与 aws_ids 对比，删掉多余的"""
+        dropped = 0
+        try:
+            resp = neptune_query(
+                f"g.V().hasLabel('{label}').project('vid','pid')"
+                f".by(id()).by(coalesce(values('{id_prop}'),constant('__missing__'))).fold()"
+            )['result']['data']['@value']
+            if not resp:
+                return 0
+            graph_map = {}  # id_prop_value → vertex_id
+            for item in resp[0].get('@value', []):
                 m = item.get('@value', [])
                 it = iter(m)
                 kv = dict(zip(it, it))
                 vid = kv.get('vid', {})
-                iid = kv.get('iid', '')
-                if isinstance(vid, dict):
-                    vid = vid.get('@value', str(vid))
-                graph_ec2[str(iid)] = str(vid)
+                pid = kv.get('pid', '')
+                if isinstance(vid, dict): vid = vid.get('@value', str(vid))
+                if isinstance(pid, dict): pid = pid.get('@value', str(pid))
+                pid = str(pid)
+                if pid != '__missing__':
+                    graph_map[pid] = str(vid)
+            stale = set(graph_map.keys()) - aws_ids
+            for pid in stale:
+                logger.info(f"GC: 删除幽灵节点 {label}[{id_prop}={pid}]")
+                neptune_query(f"g.V('{graph_map[pid]}').drop()")
+                dropped += 1
+        except Exception as e:
+            logger.warning(f"GC {label} failed: {e}")
+        return dropped
 
-        # 从 AWS 取所有运行中的 EC2 instance_id
-        aws_ec2_ids = set()
-        paginator_gc = ec2_client.get_paginator('describe_instances')
-        for page in paginator_gc.paginate(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]):
+    gc_total = 0
+    try:
+        # EC2 — 按 instance_id 对比（running 状态）
+        aws_ec2 = set()
+        for page in ec2_client.get_paginator('describe_instances').paginate(
+                Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]):
             for r in page['Reservations']:
                 for i in r['Instances']:
-                    aws_ec2_ids.add(i['InstanceId'])
+                    aws_ec2.add(i['InstanceId'])
+        gc_total += _gc_vertices('EC2Instance', 'instance_id', aws_ec2)
 
-        # 找出幽灵节点并删除
-        stale_ids = set(graph_ec2.keys()) - aws_ec2_ids
-        gc_dropped = 0
-        for iid in stale_ids:
-            vid = graph_ec2[iid]
-            logger.info(f"GC: 删除已终止的 EC2Instance instance_id={iid} vid={vid}")
-            neptune_query(f"g.V('{vid}').drop()")
-            gc_dropped += 1
-        if gc_dropped:
-            logger.info(f"GC 完成: 删除 {gc_dropped} 个幽灵 EC2Instance 节点")
-            stats['gc_dropped'] = gc_dropped
+        # Lambda — 按 name 对比
+        aws_lambda = set()
+        for page in lambda_client.get_paginator('list_functions').paginate():
+            for fn in page['Functions']:
+                aws_lambda.add(fn['FunctionName'])
+        gc_total += _gc_vertices('LambdaFunction', 'name', aws_lambda)
+
+        # RDSCluster — 按 name 对比
+        rds_client_gc = session.client('rds', region_name=REGION)
+        aws_rds_clusters = set()
+        for page in rds_client.get_paginator('describe_db_clusters').paginate():
+            for c in page['DBClusters']:
+                aws_rds_clusters.add(c['DBClusterIdentifier'])
+        gc_total += _gc_vertices('RDSCluster', 'name', aws_rds_clusters)
+        gc_total += _gc_vertices('NeptuneCluster', 'name', aws_rds_clusters)
+
+        # RDSInstance — 按 name 对比
+        aws_rds_instances = set()
+        for page in rds_client.get_paginator('describe_db_instances').paginate():
+            for i in page['DBInstances']:
+                aws_rds_instances.add(i['DBInstanceIdentifier'])
+        gc_total += _gc_vertices('RDSInstance', 'name', aws_rds_instances)
+        gc_total += _gc_vertices('NeptuneInstance', 'name', aws_rds_instances)
+
+        # EKS — 按 name 对比
+        aws_eks = set(eks_client.list_clusters().get('clusters', []))
+        gc_total += _gc_vertices('EKSCluster', 'name', aws_eks)
+
+        # LoadBalancer — 按 name 对比
+        aws_alb = set()
+        for page in elb_client.get_paginator('describe_load_balancers').paginate():
+            for lb in page['LoadBalancers']:
+                aws_alb.add(lb['LoadBalancerName'])
+        gc_total += _gc_vertices('LoadBalancer', 'name', aws_alb)
+
+        # SQS — 按 name 对比
+        sqs_client_gc = session.client('sqs', region_name=REGION)
+        aws_sqs = set()
+        for page in sqs_client.get_paginator('list_queues').paginate():
+            for url in page.get('QueueUrls', []):
+                aws_sqs.add(url.split('/')[-1])
+        gc_total += _gc_vertices('SQSQueue', 'name', aws_sqs)
+
+        # SNS — 按 name 对比
+        sns_client_gc = session.client('sns', region_name=REGION)
+        aws_sns = set()
+        for page in sns_client.get_paginator('list_topics').paginate():
+            for t in page.get('Topics', []):
+                aws_sns.add(t['TopicArn'].split(':')[-1])
+        gc_total += _gc_vertices('SNSTopic', 'name', aws_sns)
+
+        # DynamoDB — 按 name 对比
+        ddb_client_gc = session.client('dynamodb', region_name=REGION)
+        aws_ddb = set()
+        for page in ddb_client.get_paginator('list_tables').paginate():
+            aws_ddb.update(page.get('TableNames', []))
+        gc_total += _gc_vertices('DynamoDBTable', 'name', aws_ddb)
+
+        # StepFunctions — 按 name 对比
+        aws_sfn = set()
+        for page in sfn_client.get_paginator('list_state_machines').paginate():
+            for sm in page['stateMachines']:
+                aws_sfn.add(sm['name'])
+        gc_total += _gc_vertices('StepFunction', 'name', aws_sfn)
+
+        # S3 — 按 name 对比（只比当前 region）
+        s3_client_gc = session.client('s3', region_name=REGION)
+        aws_s3 = set()
+        for b in s3_client.list_buckets().get('Buckets', []):
+            try:
+                loc = s3_client.get_bucket_location(Bucket=b['Name'])
+                bucket_region = loc.get('LocationConstraint') or 'us-east-1'
+                if bucket_region == REGION:
+                    aws_s3.add(b['Name'])
+            except Exception:
+                pass
+        gc_total += _gc_vertices('S3Bucket', 'name', aws_s3)
+
+        # ECR — 按 name 对比
+        ecr_client_gc = session.client('ecr', region_name=REGION)
+        aws_ecr = set()
+        for page in ecr_client.get_paginator('describe_repositories').paginate():
+            for r in page['repositories']:
+                aws_ecr.add(r['repositoryName'])
+        gc_total += _gc_vertices('ECRRepository', 'name', aws_ecr)
+
+        if gc_total:
+            logger.info(f"GC 完成: 共删除 {gc_total} 个幽灵节点")
+            stats['gc_dropped'] = gc_total
+        else:
+            logger.info("GC 完成: 无幽灵节点")
     except Exception as e:
-        logger.error(f"GC step failed (non-fatal): {e}")
+        logger.error(f"GC step failed (non-fatal): {e}", exc_info=True)
 
     logger.info(f"=== neptune-etl-from-aws 完成: {stats} ===")
     return stats
