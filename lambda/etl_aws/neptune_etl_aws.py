@@ -1569,6 +1569,51 @@ def run_etl():
                 upsert_edge(etl_vid, neptune_cluster_vid, 'WritesTo', {'source': 'aws-etl'})
                 stats['edges'] += 1
 
+    # =========================================================
+    # Step 15: GC — 清理已终止的 EC2Instance 节点
+    #   ETL 只做 upsert，不自动删除。节点组缩容后，已终止的 EC2
+    #   会永远留在图里成为"幽灵节点"，影响爆炸半径分析准确性。
+    #   每次 ETL 结尾与 AWS 真实状态对比，删掉已不存在的节点。
+    # =========================================================
+    try:
+        # 从 Neptune 取所有 EC2Instance 的 instance_id
+        gc_resp = neptune_query(
+            "g.V().hasLabel('EC2Instance').project('vid','iid').by(id()).by(values('instance_id')).fold()"
+        )['result']['data']['@value']
+        graph_ec2 = {}  # instance_id → vertex id
+        if gc_resp:
+            for item in gc_resp[0].get('@value', []):
+                m = item.get('@value', [])
+                it = iter(m)
+                kv = dict(zip(it, it))
+                vid = kv.get('vid', {})
+                iid = kv.get('iid', '')
+                if isinstance(vid, dict):
+                    vid = vid.get('@value', str(vid))
+                graph_ec2[str(iid)] = str(vid)
+
+        # 从 AWS 取所有运行中的 EC2 instance_id
+        aws_ec2_ids = set()
+        paginator_gc = ec2_client.get_paginator('describe_instances')
+        for page in paginator_gc.paginate(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]):
+            for r in page['Reservations']:
+                for i in r['Instances']:
+                    aws_ec2_ids.add(i['InstanceId'])
+
+        # 找出幽灵节点并删除
+        stale_ids = set(graph_ec2.keys()) - aws_ec2_ids
+        gc_dropped = 0
+        for iid in stale_ids:
+            vid = graph_ec2[iid]
+            logger.info(f"GC: 删除已终止的 EC2Instance instance_id={iid} vid={vid}")
+            neptune_query(f"g.V('{vid}').drop()")
+            gc_dropped += 1
+        if gc_dropped:
+            logger.info(f"GC 完成: 删除 {gc_dropped} 个幽灵 EC2Instance 节点")
+            stats['gc_dropped'] = gc_dropped
+    except Exception as e:
+        logger.error(f"GC step failed (non-fatal): {e}")
+
     logger.info(f"=== neptune-etl-from-aws 完成: {stats} ===")
     return stats
 
