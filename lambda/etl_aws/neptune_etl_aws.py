@@ -221,18 +221,26 @@ def upsert_vertex(label: str, name: str, extra_props: dict, managed_by: str = 'm
             all_props['region'] = fb_region
     all_props.update(extra_props)  # extra_props 优先（允许覆盖，如 RDS 实例显式传 az）
     ts_now = int(time.time())
+    # onCreate: 初始创建时写入所有属性
     props_create = f"'name': '{n}', 'managedBy': '{mb}', 'source': 'aws-etl'"
-    props_match = f"'managedBy': '{mb}', 'environment': '{ENVIRONMENT}'"
+    # onMatch: 原格式（所有属性），保持 Neptune 兼容性
+    props_match = f"'managedBy': '{mb}', 'source': 'aws-etl'"
     for k, v in all_props.items():
-        ks = safe_str(k)
-        vs = safe_str(v)
+        ks = safe_str(k); vs = safe_str(v)
         props_create += f", '{ks}': '{vs}'"
-        props_match += f", '{ks}': '{vs}'"
+        props_match  += f", '{ks}': '{vs}'"
+    # 额外的 property(single,...) 链：确保所有属性以 single cardinality 写入
+    # （Neptune mergeV onMatch 默认 list cardinality，会累积值；single 覆盖该行为）
+    prop_chain = f".property(single,'managedBy','{mb}').property(single,'source','aws-etl')"
+    for k, v in all_props.items():
+        ks = safe_str(k); vs = safe_str(v)
+        prop_chain += f".property(single,'{ks}','{vs}')"
+    prop_chain += f".property(single,'last_updated',{ts_now})"
     gremlin = (
         f"g.mergeV([(T.label): '{label}', 'name': '{n}'])"
         f".option(Merge.onCreate, [(T.label): '{label}', {props_create}])"
         f".option(Merge.onMatch, [{props_match}])"
-        f".property(single,'last_updated',{ts_now})"
+        f"{prop_chain}"
         f".id()"
     )
     result = neptune_query(gremlin)
@@ -317,6 +325,32 @@ def resolve_managed_by_dict(tags: dict) -> str:
         return 'eks-managed'
     return 'manual'
 
+def resolve_resource_tags(tags) -> dict:
+    """
+    从 AWS 资源的 tags 中提取 Environment/System/Team/Tier/ManagedBy。
+    tags 可以是 list[{Key,Value}]（EC2/RDS/ALB 格式）或 dict（Lambda 格式）。
+    有 tag 用 tag，没有 tag 用 None（upsert_vertex 里跳过 None 值，保留 Neptune 已有值）。
+    Tier tag 值格式：tier0/tier1/tier2 → 统一转为 Tier0/Tier1/Tier2
+    ManagedBy tag 优先于代码推断的 managed_by（explicit > implicit）
+    """
+    if isinstance(tags, list):
+        td = {t.get('Key', ''): t.get('Value', '') for t in (tags or [])}
+    elif isinstance(tags, dict):
+        td = tags
+    else:
+        td = {}
+    tier_raw = td.get('Tier', '') or td.get('tier', '')
+    tier = tier_raw.capitalize() if tier_raw else None  # tier0 → Tier0
+    # ManagedBy tag 值映射：cdk/terraform/manual → 保持小写
+    managed_by_tag = (td.get('ManagedBy') or td.get('managedby') or '').lower() or None
+    return {
+        'environment':   td.get('Environment') or None,
+        'system':        td.get('System')       or None,
+        'team':          td.get('Team')          or None,
+        'tier':          tier,
+        'managed_by_tag': managed_by_tag,  # 显式 tag，优先于代码推断
+    }
+
 # ===== 采集各资源 =====
 
 def collect_ec2_instances(ec2_client) -> list:
@@ -332,16 +366,23 @@ def collect_ec2_instances(ec2_client) -> list:
                 name = next((t['Value'] for t in tags if t['Key'] == 'Name'), instance_id)
                 # EKS 节点标记：有 eks: 前缀的 tag
                 is_eks_node = any(t['Key'].startswith('eks:') for t in tags)
+                rtags = resolve_resource_tags(tags)
+                # ManagedBy tag 优先于推断值
+                managed_by = rtags.get('managed_by_tag') or resolve_managed_by(tags)
                 nodes.append({
                     'id': instance_id,
                     'name': name,
                     'instance_type': inst.get('InstanceType', ''),
                     'az': inst.get('Placement', {}).get('AvailabilityZone', ''),
                     'private_ip': inst.get('PrivateIpAddress', ''),
-                    'private_dns': inst.get('PrivateDnsName', ''),  # ContainerInsights NodeName（仅EKS）
+                    'private_dns': inst.get('PrivateDnsName', ''),
                     'subnet_id': inst.get('SubnetId', ''),
-                    'managed_by': resolve_managed_by(tags),
+                    'managed_by': managed_by,
                     'is_eks_node': is_eks_node,
+                    'environment': rtags['environment'],
+                    'system': rtags['system'],
+                    'team': rtags['team'],
+                    'tag_tier': rtags['tier'],
                 })
     logger.info(f"EC2 instances: {len(nodes)}")
     return nodes
@@ -412,9 +453,12 @@ def collect_load_balancers(elb_client) -> list:
             try:
                 tags_resp = elb_client.describe_tags(ResourceArns=[lb['LoadBalancerArn']])
                 tag_list = tags_resp['TagDescriptions'][0]['Tags'] if tags_resp['TagDescriptions'] else []
-                managed_by = resolve_managed_by_dict({t['Key']: t['Value'] for t in tag_list})
+                tag_dict = {t['Key']: t['Value'] for t in tag_list}
+                rtags = resolve_resource_tags(tag_list)
+                managed_by = rtags.get('managed_by_tag') or resolve_managed_by_dict(tag_dict)
             except Exception:
                 managed_by = 'manual'
+                rtags = {'environment': None, 'system': None, 'team': None, 'tier': None}
             # ALB 跨多个 AZ，取 AZ 列表
             azs = [az_info['ZoneName'] for az_info in lb.get('AvailabilityZones', [])]
             lbs.append({
@@ -425,6 +469,10 @@ def collect_load_balancers(elb_client) -> list:
                 'type': lb.get('Type', ''),
                 'azs': azs,
                 'managed_by': managed_by,
+                'environment': rtags['environment'],
+                'system': rtags['system'],
+                'team': rtags['team'],
+                'tag_tier': rtags['tier'],
             })
     logger.info(f"Load Balancers: {len(lbs)}")
     return lbs
@@ -463,9 +511,12 @@ def collect_lambda_functions(lambda_client) -> list:
             fn_arn = fn['FunctionArn']
             try:
                 tags_resp = lambda_client.list_tags(Resource=fn_arn)
-                managed_by = resolve_managed_by_dict(tags_resp.get('Tags', {}))
+                tags_dict = tags_resp.get('Tags', {})
+                rtags = resolve_resource_tags(tags_dict)
+                managed_by = rtags.get('managed_by_tag') or resolve_managed_by_dict(tags_dict)
             except Exception:
                 managed_by = 'manual'
+                rtags = {'environment': None, 'system': None, 'team': None, 'tier': None}
             # env_vars 和 MemorySize 直接从 list_functions 响应里读（无需额外 API 调用）
             env_vars = fn.get('Environment', {}).get('Variables', {})
             memory_size = fn.get('MemorySize', -1)
@@ -476,6 +527,10 @@ def collect_lambda_functions(lambda_client) -> list:
                 'managed_by': managed_by,
                 'env_vars': env_vars,
                 'memory_size': memory_size,
+                'environment': rtags['environment'],
+                'system': rtags['system'],
+                'team': rtags['team'],
+                'tag_tier': rtags['tier'],
             })
     logger.info(f"Lambda functions: {len(fns)}")
     return fns
@@ -538,7 +593,8 @@ def collect_rds_clusters(rds_client) -> list:
     for page in paginator.paginate():
         for cluster in page['DBClusters']:
             tag_dict = {t['Key']: t['Value'] for t in cluster.get('TagList', [])}
-            managed_by = resolve_managed_by_dict(tag_dict)
+            rtags = resolve_resource_tags(tag_dict)
+            managed_by = rtags.get('managed_by_tag') or resolve_managed_by_dict(tag_dict)
             clusters.append({
                 'id': cluster['DBClusterIdentifier'],
                 'arn': cluster.get('DBClusterArn', ''),
@@ -549,6 +605,10 @@ def collect_rds_clusters(rds_client) -> list:
                 'reader_endpoint': cluster.get('ReaderEndpoint', ''),
                 'azs': cluster.get('AvailabilityZones', []),
                 'managed_by': managed_by,
+                'environment': rtags['environment'],
+                'system': rtags['system'],
+                'team': rtags['team'],
+                'tag_tier': rtags['tier'],
                 'member_roles': {
                     m['DBInstanceIdentifier']: m.get('IsClusterWriter', False)
                     for m in cluster.get('DBClusterMembers', [])
@@ -598,9 +658,12 @@ def collect_sqs_queues(sqs_client) -> list:
                     ).get('Attributes', {})
                     try:
                         tags_resp = sqs_client.list_queue_tags(QueueUrl=url)
-                        managed_by = resolve_managed_by_dict(tags_resp.get('Tags', {}))
+                        tags_dict = tags_resp.get('Tags', {})
+                        rtags = resolve_resource_tags(tags_dict)
+                        managed_by = rtags.get('managed_by_tag') or resolve_managed_by_dict(tags_dict)
                     except Exception:
                         managed_by = 'manual'
+                        rtags = {'environment': None, 'system': None, 'team': None, 'tier': None}
                     is_dlq = 'dlq' in queue_name.lower() or 'dead' in queue_name.lower()
                     # 解析 RedrivePolicy（DLQ 上的属性，指向主队列 ARN）
                     redrive_target_arn = None
@@ -619,6 +682,10 @@ def collect_sqs_queues(sqs_client) -> list:
                         'is_dlq': str(is_dlq),
                         'managed_by': managed_by,
                         'redrive_target_arn': redrive_target_arn,  # DLQ→主队列的 ARN
+                        'environment': rtags['environment'],
+                        'system': rtags['system'],
+                        'team': rtags['team'],
+                        'tag_tier': rtags['tier'],
                     })
                 except Exception as e:
                     logger.warning(f"SQS queue {queue_name} attrs failed: {e}")
@@ -1284,6 +1351,15 @@ def run_etl():
             if key.lower() in inst['name'].lower():
                 priority = p
                 break
+        # tag 里的 Tier 优先于代码硬编码
+        if inst.get('tag_tier'):
+            priority = inst['tag_tier']
+        # 过滤掉 None 值，避免覆盖 Neptune 中已有的属性
+        extra = {k: v for k, v in {
+            'environment': inst.get('environment'),
+            'system':      inst.get('system'),
+            'team':        inst.get('team'),
+        }.items() if v is not None}
         inst_vid = upsert_vertex('EC2Instance', inst['name'], {
             'instance_id': inst['id'],
             'instance_type': inst['instance_type'],
@@ -1291,6 +1367,7 @@ def run_etl():
             'private_ip': inst['private_ip'],
             'recovery_priority': priority,
             'health_status': 'healthy',
+            **extra,
         }, inst['managed_by'])
         inst_vid_map[inst['id']] = inst_vid
         stats['vertices'] += 1
@@ -1340,12 +1417,18 @@ def run_etl():
     lb_arn_map = {lb['arn']: lb['name'] for lb in load_balancers}
 
     for lb in load_balancers:
+        lb_extra = {k: v for k, v in {
+            'environment': lb.get('environment'),
+            'system':      lb.get('system'),
+            'team':        lb.get('team'),
+        }.items() if v is not None}
         lb_vid = upsert_vertex('LoadBalancer', lb['name'], {
             'arn': lb['arn'],
             'dns': lb['dns'],
             'scheme': lb['scheme'],
             'lb_type': lb['type'],
             'health_status': 'healthy',
+            **lb_extra,
         }, lb['managed_by'])
         stats['vertices'] += 1
         # ALB → AZ: LocatedIn（ALB 可以跨多个 AZ）
@@ -1380,17 +1463,25 @@ def run_etl():
     lambda_fns = collect_lambda_functions(lambda_client)
     fn_vid_map = {}
     for fn in lambda_fns:
-        # 按名称匹配恢复优先级
+        # 按名称匹配恢复优先级，tag 优先
         priority = 'Tier2'
         for key, p in LAMBDA_RECOVERY_PRIORITY.items():
             if key in fn['name'].lower():
                 priority = p
                 break
+        if fn.get('tag_tier'):
+            priority = fn['tag_tier']
+        extra = {k: v for k, v in {
+            'environment': fn.get('environment'),
+            'system':      fn.get('system'),
+            'team':        fn.get('team'),
+        }.items() if v is not None}
         fn_vid = upsert_vertex('LambdaFunction', fn['name'], {
             'arn': fn['arn'],
             'runtime': fn['runtime'],
             'recovery_priority': priority,
             'health_status': 'healthy',
+            **extra,
         }, fn['managed_by'])
         fn_vid_map[fn['name']] = fn_vid
         stats['vertices'] += 1
@@ -1489,6 +1580,11 @@ def run_etl():
     for cluster in rds_clusters:
         is_neptune = cluster['engine'] == 'neptune'
         vertex_label = 'NeptuneCluster' if is_neptune else 'RDSCluster'
+        rds_extra = {k: v for k, v in {
+            'environment': cluster.get('environment'),
+            'system':      cluster.get('system'),
+            'team':        cluster.get('team'),
+        }.items() if v is not None}
         c_vid = upsert_vertex(vertex_label, cluster['id'], {
             'arn': cluster['arn'],
             'engine': cluster['engine'],
@@ -1496,6 +1592,7 @@ def run_etl():
             'status': cluster['status'],
             'endpoint': cluster['endpoint'],
             'reader_endpoint': cluster['reader_endpoint'],
+            **rds_extra,
         }, cluster['managed_by'])
         rds_cluster_vid_map[cluster['id']] = c_vid
         stats['vertices'] += 1
@@ -1543,11 +1640,17 @@ def run_etl():
     sqs_arn_to_name = {}   # arn → name（用于 SNS 订阅查找）
     sqs_vid_map = {}       # name → vid
     for q in sqs_queues:
+        extra = {k: v for k, v in {
+            'environment': q.get('environment'),
+            'system':      q.get('system'),
+            'team':        q.get('team'),
+        }.items() if v is not None}
         q_vid = upsert_vertex('SQSQueue', q['name'], {
             'arn': q['arn'],
             'url': q['url'],
             'is_dlq': q['is_dlq'],
             'health_status': 'healthy',
+            **extra,
         }, q['managed_by'])
         sqs_vid_map[q['name']] = q_vid
         sqs_arn_to_name[q['arn']] = q['name']
