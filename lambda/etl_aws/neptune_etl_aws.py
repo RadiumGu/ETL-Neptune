@@ -82,6 +82,17 @@ LAMBDA_RECOVERY_PRIORITY = {
     'dynamodb-query':     'Tier2',   # DynamoDB 查询辅助 Lambda
 }
 
+MICROSERVICE_RECOVERY_PRIORITY = {
+    'petsite':             'Tier0',
+    'petsearch':           'Tier0',
+    'payforadoption':      'Tier0',
+    'petlistadoptions':    'Tier1',
+    'petadoptionshistory': 'Tier1',
+    'petstatusupdater':    'Tier1',
+    'petfood':             'Tier1',
+    'trafficgenerator':    'Tier2',
+}
+
 EC2_RECOVERY_PRIORITY = {
     # deepflow-server 是关键观测基础设施
     'deepflow':           'Tier1',
@@ -111,7 +122,7 @@ BUSINESS_CAPABILITIES = [
         'description':       '宠物库存状态异步管理（领养后更新可用性）',
         'recovery_priority': 'Tier1',
         'serves_services':   [],                    # petstatusupdater 是 Lambda，不是 K8s 微服务
-        'serves_lambda':     ['petstatusupdater'],  # 模糊匹配 Lambda 函数名
+        'serves_lambda':     ['statusupdater'],  # 模糊匹配 Lambda 函数名（含 statusupdaterservice）
         'depends_on_types':  ['DynamoDBTable', 'SQSQueue'],
     },
     {
@@ -200,8 +211,9 @@ def upsert_vertex(label: str, name: str, extra_props: dict, managed_by: str = 'm
         if fb_region:
             all_props['region'] = fb_region
     all_props.update(extra_props)  # extra_props 优先（允许覆盖，如 RDS 实例显式传 az）
+    ts_now = int(time.time())
     props_create = f"'name': '{n}', 'managedBy': '{mb}', 'source': 'aws-etl'"
-    props_match = f"'managedBy': '{mb}', 'last_updated': {int(time.time())}, 'environment': '{ENVIRONMENT}'"
+    props_match = f"'managedBy': '{mb}', 'environment': '{ENVIRONMENT}'"
     for k, v in all_props.items():
         ks = safe_str(k)
         vs = safe_str(v)
@@ -211,6 +223,7 @@ def upsert_vertex(label: str, name: str, extra_props: dict, managed_by: str = 'm
         f"g.mergeV([(T.label): '{label}', 'name': '{n}'])"
         f".option(Merge.onCreate, [(T.label): '{label}', {props_create}])"
         f".option(Merge.onMatch, [{props_match}])"
+        f".property(single,'last_updated',{ts_now})"
         f".id()"
     )
     result = neptune_query(gremlin)
@@ -527,7 +540,10 @@ def collect_rds_clusters(rds_client) -> list:
                 'reader_endpoint': cluster.get('ReaderEndpoint', ''),
                 'azs': cluster.get('AvailabilityZones', []),
                 'managed_by': managed_by,
-                'members': [m['DBInstanceIdentifier'] for m in cluster.get('DBClusterMembers', [])],
+                'member_roles': {
+                    m['DBInstanceIdentifier']: m.get('IsClusterWriter', False)
+                    for m in cluster.get('DBClusterMembers', [])
+                },
             })
     logger.info(f"RDS clusters: {len(clusters)}")
     return clusters
@@ -1033,12 +1049,13 @@ def upsert_business_capabilities() -> dict:
         for svc_name in cap.get('serves_services', []):
             sn = safe_str(svc_name)
             # 确保 Microservice 节点存在（从 etl_aws 写入，DeepFlow 可能还没采集到）
+            svc_priority = MICROSERVICE_RECOVERY_PRIORITY.get(svc_name, cap.get('recovery_priority', 'Tier2'))
             svc_vid = upsert_vertex('Microservice', sn, {
                 'namespace': 'default',
                 'source': 'business-layer',
                 'fault_boundary': 'az',
                 'region': REGION,
-                'recovery_priority': cap.get('recovery_priority', 'Tier2'),
+                'recovery_priority': svc_priority,
             }, 'manual')
             if not svc_vid:
                 logger.debug(f"Microservice upsert failed: {sn}")
@@ -1062,7 +1079,7 @@ def upsert_business_capabilities() -> dict:
             try:
                 neptune_query(
                     f"g.V('{cap_vid}').as('cap')"
-                    f".V().hasLabel('LambdaFunction').filter(__.values('name').containing('{fp}'))"
+                    f".V().hasLabel('LambdaFunction').has('name', containing('{fp}'))"
                     f".coalesce("
                     f"  __.inE('Serves').where(__.outV().hasId('{cap_vid}')),"
                     f"  __.addE('Serves').from('cap')"
@@ -1355,10 +1372,18 @@ def run_etl():
             upsert_edge(c_vid, region_vid, 'LocatedIn', {'source': 'aws-etl'})
             stats['edges'] += 1
 
+    rds_instance_writer_map = {}
+    for cluster in rds_clusters:
+        for inst_id, is_writer in cluster.get('member_roles', {}).items():
+            rds_instance_writer_map[inst_id] = is_writer
+
     for inst in rds_instances:
         is_neptune = inst['engine'] == 'neptune'
         vertex_label = 'NeptuneInstance' if is_neptune else 'RDSInstance'
-        role = 'writer' if inst['is_writer'] else 'reader'
+        if inst['id'] in rds_instance_writer_map:
+            role = 'writer' if rds_instance_writer_map[inst['id']] else 'reader'
+        else:
+            role = 'writer' if inst['is_writer'] else 'reader'
         i_vid = upsert_vertex(vertex_label, inst['id'], {
             'arn': inst['arn'],
             'engine': inst['engine'],

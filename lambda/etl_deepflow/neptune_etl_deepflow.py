@@ -228,18 +228,54 @@ def build_ip_service_map() -> dict:
         return ip_map
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
     try:
-        resp = requests.get(f"{k8s_endpoint}/api/v1/pods", headers=headers, verify=ca_file, timeout=15)
+        # Step 1: node_name → AZ 映射
+        node_az_map = {}
+        try:
+            nodes_resp = requests.get(
+                f"{k8s_endpoint}/api/v1/nodes",
+                headers=headers, verify=ca_file, timeout=15
+            )
+            if nodes_resp.status_code == 200:
+                for node in nodes_resp.json().get('items', []):
+                    node_name = node.get('metadata', {}).get('name', '')
+                    labels = node.get('metadata', {}).get('labels', {})
+                    az = (
+                        labels.get('topology.kubernetes.io/zone') or
+                        labels.get('failure-domain.beta.kubernetes.io/zone', '')
+                    )
+                    if node_name and az:
+                        node_az_map[node_name] = az
+            logger.info(f"K8s node→AZ map: {len(node_az_map)} nodes, AZs: {set(node_az_map.values())}")
+        except Exception as e:
+            logger.warning(f"K8s nodes AZ map failed: {e}")
+
+        # Step 2: 查 pods，带 nodeName 解析 AZ
+        resp = requests.get(
+            f"{k8s_endpoint}/api/v1/pods",
+            headers=headers, verify=ca_file, timeout=15
+        )
         if resp.status_code == 200:
             for item in resp.json().get('items', []):
                 pod_ip = item.get('status', {}).get('podIP', '')
                 ns = item.get('metadata', {}).get('namespace', 'default')
                 labels = item.get('metadata', {}).get('labels', {})
                 pod_name = item.get('metadata', {}).get('name', '')
-                app_label = labels.get('app') or labels.get('app.kubernetes.io/name') or labels.get('name') or ''
+                node_name = item.get('spec', {}).get('nodeName', '')
+                app_label = (
+                    labels.get('app') or
+                    labels.get('app.kubernetes.io/name') or
+                    labels.get('name') or ''
+                )
                 svc_name = app_label if app_label else pod_name.rsplit('-', 2)[0]
+                az = node_az_map.get(node_name, '')
                 if pod_ip and svc_name:
-                    ip_map[pod_ip] = {'name': svc_name, 'namespace': ns, 'type': 'Microservice'}
-        logger.info(f"IP→Service map: {len(ip_map)} entries")
+                    ip_map[pod_ip] = {
+                        'name': svc_name,
+                        'namespace': ns,
+                        'type': 'Microservice',
+                        'az': az,
+                    }
+        logger.info(f"IP→Service map: {len(ip_map)} entries (with AZ info)")
     finally:
         try:
             os.unlink(ca_file)
@@ -322,16 +358,26 @@ def batch_upsert_nodes(services: list):
         parts = []
         for svc in batch:
             n, ns, ip = safe_str(svc['name']), safe_str(svc['namespace']), safe_str(svc['ip'])
+            az = safe_str(svc.get('az', ''))
             priority = MICROSERVICE_RECOVERY_PRIORITY.get(n, 'Tier2')
+            create_props = (
+                f"'namespace': '{ns}', 'ip': '{ip}', 'source': 'deepflow', "
+                f"'environment': '{ENVIRONMENT}', 'recovery_priority': '{priority}', "
+                f"'fault_boundary': 'az', 'region': '{REGION}'"
+            )
+            match_props = (
+                f"'ip': '{ip}', 'namespace': '{ns}', "
+                f"'environment': '{ENVIRONMENT}', 'recovery_priority': '{priority}', "
+                f"'fault_boundary': 'az'"
+            )
+            if az:
+                create_props += f", 'az': '{az}'"
+                match_props += f", 'az': '{az}'"
             parts.append(
                 f"mergeV([(T.label): 'Microservice', 'name': '{n}'])"
                 f".option(Merge.onCreate, [(T.label): 'Microservice', 'name': '{n}', "
-                f"'namespace': '{ns}', 'ip': '{ip}', 'source': 'deepflow', "
-                f"'environment': '{ENVIRONMENT}', 'recovery_priority': '{priority}', "
-                f"'fault_boundary': 'az', 'region': '{REGION}'])"
-                f".option(Merge.onMatch, ['ip': '{ip}', 'namespace': '{ns}', "
-                f"'environment': '{ENVIRONMENT}', 'recovery_priority': '{priority}', "
-                f"'fault_boundary': 'az'])"
+                f"{create_props}])"
+                f".option(Merge.onMatch, [{match_props}])"
             )
         gremlin = "g." + ".".join(parts)
         try:
@@ -427,30 +473,30 @@ def batch_fetch_dependency_and_update(service_names: list, l7_metrics: dict,
         svc_ip = ip_map_by_name.get(name, '')
         l7 = l7_metrics.get(svc_ip, {})
         priority = MICROSERVICE_RECOVERY_PRIORITY.get(name, 'Tier2')
-        props = [f".property('metrics_updated_at',{ts})",
-                 f".property('environment','{ENVIRONMENT}')",
-                 f".property('recovery_priority','{priority}')",
-                 f".property('fault_boundary','az')",
-                 f".property('region','{REGION}')"]
+        props = [f".property(single,'metrics_updated_at',{ts})",
+                 f".property(single,'environment','{ENVIRONMENT}')",
+                 f".property(single,'recovery_priority','{priority}')",
+                 f".property(single,'fault_boundary','az')",
+                 f".property(single,'region','{REGION}')"]
         for key in ['p50_latency_ms', 'p99_latency_ms', 'rps', 'error_rate']:
             v = l7.get(key, -1)
-            props.append(f".property('{key}',{float(v):.4f})")
+            props.append(f".property(single,'{key}',{float(v):.4f})")
         # active_connections（来自 network_map L4 数据）
         ac = active_connections_map.get(svc_ip, -1)
-        props.append(f".property('active_connections',{int(ac)})")
-        props.append(f".property('replica_count',{int(replica_counts.get(name, -1))})")
+        props.append(f".property(single,'active_connections',{int(ac)})")
+        props.append(f".property(single,'replica_count',{int(replica_counts.get(name, -1))})")
         # K8s resource limits
         limits = resource_limits.get(name, {})
         if limits.get('cpu'):
             cpu_s = safe_str(limits['cpu'])
-            props.append(f".property('resource_limit_cpu','{cpu_s}')")
+            props.append(f".property(single,'resource_limit_cpu','{cpu_s}')")
         if limits.get('memory'):
             mem_s = safe_str(limits['memory'])
-            props.append(f".property('resource_limit_memory','{mem_s}')")
+            props.append(f".property(single,'resource_limit_memory','{mem_s}')")
         for key in ['upstream_count', 'downstream_count']:
-            props.append(f".property('{key}',{int(dep.get(key, -1))})")
+            props.append(f".property(single,'{key}',{int(dep.get(key, -1))})")
         for key in ['is_entry_point', 'has_db_dependency', 'has_cache_dependency']:
-            props.append(f".property('{key}',{'true' if dep.get(key) else 'false'})")
+            props.append(f".property(single,'{key}',{'true' if dep.get(key) else 'false'})")
 
         try:
             neptune_query(f"g.V().has('Microservice','name','{n}'){''.join(props)}")
@@ -519,8 +565,8 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
         if src_name == dst_name:
             continue
 
-        nodes_set[src_name] = {'name': src_name, 'namespace': src_info['namespace'], 'ip': src_ip}
-        nodes_set[dst_name] = {'name': dst_name, 'namespace': dst_info['namespace'], 'ip': dst_ip}
+        nodes_set[src_name] = {'name': src_name, 'namespace': src_info['namespace'], 'ip': src_ip, 'az': src_info.get('az', '')}
+        nodes_set[dst_name] = {'name': dst_name, 'namespace': dst_info['namespace'], 'ip': dst_ip, 'az': dst_info.get('az', '')}
         ip_map_by_name[src_name] = src_ip
         ip_map_by_name[dst_name] = dst_ip
         edges_list.append({

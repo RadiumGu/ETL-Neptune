@@ -400,6 +400,43 @@ def run_etl(stack_names: list = None):
             written = write_deps_to_neptune(deps, stack_name)
             total_deps += written
             logger.info(f"  [{stack_name}] 写入 {written} 条 DependsOn 边到 Neptune")
+
+            # SNS Subscription → SQS: PublishesTo（sns:protocol=sqs 订阅）
+            resources = template.get('Resources', {})
+            for logical_id, resource in resources.items():
+                if resource.get('Type') != 'AWS::SNS::Subscription':
+                    continue
+                props_r = resource.get('Properties', {})
+                if props_r.get('Protocol', '') != 'sqs':
+                    continue
+                topic_arn_val = props_r.get('TopicArn', {})
+                topic_logical = None
+                if isinstance(topic_arn_val, dict):
+                    topic_logical = topic_arn_val.get('Ref')
+                    if not topic_logical:
+                        ga = topic_arn_val.get('Fn::GetAtt', [])
+                        if isinstance(ga, list) and ga:
+                            topic_logical = ga[0]
+                endpoint_val = props_r.get('Endpoint', {})
+                queue_logical = None
+                if isinstance(endpoint_val, dict):
+                    ga = endpoint_val.get('Fn::GetAtt', [])
+                    if isinstance(ga, list) and ga:
+                        queue_logical = ga[0]
+                    elif 'Ref' in endpoint_val:
+                        queue_logical = endpoint_val['Ref']
+                if not topic_logical or not queue_logical:
+                    continue
+                topic_phys = physical_map.get(topic_logical, {})
+                queue_phys = physical_map.get(queue_logical, {})
+                if not topic_phys.get('physical_id') or not queue_phys.get('physical_id'):
+                    continue
+                t_vid = get_or_create_vertex('SNSTopic', topic_phys['physical_id'], stack_name)
+                q_vid = get_or_create_vertex('SQSQueue', queue_phys['physical_id'], stack_name)
+                if t_vid and q_vid:
+                    upsert_cfn_edge(t_vid, q_vid, 'PublishesTo', stack_name, f'Subscription:{logical_id}')
+                    logger.info(f"PublishesTo: {topic_phys['physical_id']} → {queue_phys['physical_id']}")
+                    total_deps += 1
         except Exception as e:
             logger.error(f"Stack {stack_name} processing failed: {e}", exc_info=True)
 
