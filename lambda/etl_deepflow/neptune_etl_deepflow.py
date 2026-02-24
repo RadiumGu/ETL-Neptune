@@ -623,6 +623,15 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
         src_name, dst_name = src_info['name'], dst_info['name']
         if src_name == dst_name:
             continue
+        # 拦截 ARN 格式和 AWS TargetGroup 命名（belt-and-suspenders）
+        def _is_valid_svc_name(n: str) -> bool:
+            if n.startswith('arn:'):        return False  # ARN
+            if '/' in n:                    return False  # ARN path 或非法名称
+            if len(n) > 64:                 return False  # K8s svc name 最长 63
+            return True
+        if not _is_valid_svc_name(src_name) or not _is_valid_svc_name(dst_name):
+            logger.debug(f"跳过非法服务名: {src_name} -> {dst_name}")
+            continue
 
         nodes_set[src_name] = {'name': src_name, 'namespace': src_info['namespace'], 'ip': src_ip, 'az': src_info.get('az', '')}
         nodes_set[dst_name] = {'name': dst_name, 'namespace': dst_info['namespace'], 'ip': dst_ip, 'az': dst_info.get('az', '')}
