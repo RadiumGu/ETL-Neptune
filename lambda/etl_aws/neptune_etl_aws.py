@@ -1552,21 +1552,6 @@ def run_etl():
             upsert_edge(q_vid, region_vid, 'LocatedIn', {'source': 'aws-etl'})
             stats['edges'] += 1
 
-    # SQS DLQ → 主队列: DeadLetterOf
-    # RedrivePolicy 在主队列上，指向 DLQ 的 ARN
-    # 边方向：DLQ →DeadLetterOf→ MainQueue（表示"此队列是谁的死信队列"）
-    for q in sqs_queues:
-        target_arn = q.get('redrive_target_arn')
-        if not target_arn:
-            continue
-        # q 是主队列，target_arn 是 DLQ 的 ARN
-        dlq_name = sqs_arn_to_name.get(target_arn)
-        if dlq_name and sqs_vid_map.get(dlq_name) and sqs_vid_map.get(q['name']):
-            upsert_edge(sqs_vid_map[dlq_name], sqs_vid_map[q['name']], 'DeadLetterOf',
-                        {'source': 'aws-etl'})
-            stats['edges'] += 1
-            logger.info(f"DeadLetterOf: {dlq_name} → {q['name']}")
-
     # Lambda → SQS: AccessesData（env var）
     for fn in lambda_fns:
         fn_vid = fn_vid_map.get(fn['name'])
