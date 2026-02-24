@@ -34,6 +34,9 @@ EKS_CLUSTER_ARN = os.environ.get('EKS_CLUSTER_ARN',
 BATCH_SIZE = int(os.environ.get('BATCH_SIZE', '20'))
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'prod')
 
+# 只采集这些 namespace 的 pod（PetSite 业务 namespace）
+# deepflow、kube-system 等监控/基础设施 namespace 不纳入图，避免形成孤立分量
+INCLUDED_NAMESPACES = {'default'}
 # ===== PetSite 服务恢复优先级（基于代码分析）=====
 # Tier0: 核心收益路径，宕机直接影响用户无法领养宠物
 # Tier1: 重要功能，宕机导致体验降级但主流程仍可运行
@@ -270,6 +273,8 @@ def build_ip_service_map() -> dict:
             for item in resp.json().get('items', []):
                 pod_ip = item.get('status', {}).get('podIP', '')
                 ns = item.get('metadata', {}).get('namespace', 'default')
+                if ns not in INCLUDED_NAMESPACES:
+                    continue  # 跳过 deepflow / kube-system 等非业务 namespace
                 labels = item.get('metadata', {}).get('labels', {})
                 pod_name = item.get('metadata', {}).get('name', '')
                 node_name = item.get('spec', {}).get('nodeName', '')
@@ -660,6 +665,21 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
         logger.info(f"Neptune 图状态: 顶点={v_count}, 边={e_count}")
     except Exception as e:
         logger.warning(f"Verification failed: {e}")
+
+    # GC：用单条 Gremlin 直接删除旧 K8s 原名节点（alias 存在前遗留的幽灵节点）
+    # 典型：pay-for-adoption→payforadoption、list-adoptions→petlistadoptions
+    try:
+        stale_keys = list(K8S_SERVICE_ALIAS.keys())
+        dropped = neptune_query(
+            f"g.V().hasLabel('Microservice').has('source','deepflow')"
+            f".where(values('name').is(within({','.join(repr(k) for k in stale_keys)})))"
+            f".sideEffect(drop()).count()"
+        )['result']['data']['@value'][0]
+        if isinstance(dropped, dict): dropped = dropped.get('@value', 0)
+        if int(dropped) > 0:
+            logger.info(f"Microservice GC: 删除 {dropped} 个旧 K8s 原名节点")
+    except Exception as e:
+        logger.warning(f"Microservice GC failed (non-fatal): {e}")
 
     duration = int((time.time() - t0) * 1000)
     logger.info(f"=== ETL 完成: nodes={len(nodes_list)}, edges={len(edges_list)}, {duration}ms ===")
