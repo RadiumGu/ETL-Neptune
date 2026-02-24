@@ -40,17 +40,29 @@ ENVIRONMENT = os.environ.get('ENVIRONMENT', 'prod')
 # Tier2: 辅助功能
 MICROSERVICE_RECOVERY_PRIORITY = {
     # Tier0 - 核心领养流程
-    'petsite':           'Tier0',  # 前端入口，所有流量入口
-    'petsearch':         'Tier0',  # 宠物搜索/浏览，无此服务用户看不到宠物
-    'payforadoption':    'Tier0',  # 支付/领养事务处理，核心收益
+    'petsite':           'Tier0',
+    'petsearch':         'Tier0',
+    'payforadoption':    'Tier0',
     # Tier1 - 重要但非阻塞
-    'petlistadoptions':  'Tier1',  # 领养列表展示，降级不影响主流程
-    'petadoptionshistory': 'Tier1', # 历史记录查询
-    'petstatusupdater':  'Tier1',  # 宠物状态异步更新（SQS驱动）
-    'petfood':           'Tier1',  # 宠物食品信息
+    'petlistadoptions':  'Tier1',
+    'petadoptionshistory': 'Tier1',
+    'petstatusupdater':  'Tier1',
+    'petfood':           'Tier1',
     # Tier2 - 辅助
-    'trafficgenerator':  'Tier2',  # 流量生成，非业务服务
+    'trafficgenerator':  'Tier2',
 }
+
+# K8s pod app label → Neptune 微服务名映射
+# K8s 部署使用 kebab-case（pay-for-adoption），但 Neptune/DeepFlow 用 PetSite 代码约定名
+K8S_SERVICE_ALIAS = {
+    'pay-for-adoption': 'payforadoption',
+    'list-adoptions':   'petlistadoptions',
+    'search-service':   'petsearch',
+    'pethistory':       'pethistory',
+    'traffic-generator': 'trafficgenerator',
+    # petsite pod label 已是 'petsite'，无需 alias
+}
+
 
 # ===== Neptune 请求（复用 session）=====
 
@@ -267,6 +279,8 @@ def build_ip_service_map() -> dict:
                     labels.get('name') or ''
                 )
                 svc_name = app_label if app_label else pod_name.rsplit('-', 2)[0]
+                # 应用 K8s pod label → Neptune 微服务名别名映射
+                svc_name = K8S_SERVICE_ALIAS.get(svc_name, svc_name)
                 az = node_az_map.get(node_name, '')
                 if pod_ip and svc_name:
                     ip_map[pod_ip] = {
@@ -372,7 +386,7 @@ def batch_upsert_nodes(services: list):
             )
             if az:
                 create_props += f", 'az': '{az}'"
-                match_props += f", 'az': '{az}'"
+                # NOTE: az 不放入 match_props（list cardinality），改为后置 property(single) 更新
             parts.append(
                 f"mergeV([(T.label): 'Microservice', 'name': '{n}'])"
                 f".option(Merge.onCreate, [(T.label): 'Microservice', 'name': '{n}', "
@@ -579,6 +593,36 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
     nodes_list = list(nodes_set.values())
     logger.info(f"批量 upsert {len(nodes_list)} 个节点...")
     batch_upsert_nodes(nodes_list)
+
+    # 5b. 用 property(single,'az',...) 更新 az（mergeV onMatch dict 是 list cardinality，不能放里面）
+    # 从 ip_map 构建 service→主AZ 映射（同名服务取出现次数最多的 AZ）
+    from collections import Counter as _Counter
+    svc_az_counter: dict = {}
+    for pod_ip, info in ip_map.items():
+        sn = info['name']
+        az_val = info.get('az', '')
+        if az_val:
+            if sn not in svc_az_counter:
+                svc_az_counter[sn] = _Counter()
+            svc_az_counter[sn][az_val] += 1
+    svc_az_map = {
+        sn: counter.most_common(1)[0][0]
+        for sn, counter in svc_az_counter.items()
+        if counter
+    }
+    az_updated = 0
+    for sn, az_val in svc_az_map.items():
+        n = safe_str(sn)
+        az_s = safe_str(az_val)
+        try:
+            neptune_query(
+                f"g.V().hasLabel('Microservice').has('name','{n}')"
+                f".property(single,'az','{az_s}')"
+            )
+            az_updated += 1
+        except Exception as e:
+            logger.error(f"Update az {sn}: {e}")
+    logger.info(f"az 属性更新完成: {az_updated} 个服务")
 
     # 6. 写入边（复用连接，无需 get_vertex_id）
     logger.info(f"upsert {len(edges_list)} 条边...")
