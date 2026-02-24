@@ -169,6 +169,56 @@ GROUP BY server_ip
     return result
 
 
+def fetch_nfm_throttling(ip_map: dict) -> dict:
+    """
+    查询 prometheus.samples 最近5分钟内各 pod 的 NFM 限速指标
+    多副本同服务取 OR（任一 pod 被限速，服务即标记）
+    返回 {svc_name: {'nfm_bw_throttled': bool, 'nfm_pps_throttled': bool, 'nfm_conntrack_throttled': bool}}
+    """
+    sql = """
+SELECT
+    IPv4NumToString(ip4) AS pod_ip,
+    sumIf(value, m.name IN ('bw_in_allowance_exceeded', 'bw_out_allowance_exceeded')) AS bw_exceeded,
+    sumIf(value, m.name = 'pps_allowance_exceeded') AS pps_exceeded,
+    sumIf(value, m.name = 'conntrack_allowance_exceeded') AS conntrack_exceeded
+FROM prometheus.samples s
+JOIN flow_tag.prometheus_metric_name_map m ON s.metric_id = m.id
+WHERE m.name IN ('bw_in_allowance_exceeded', 'bw_out_allowance_exceeded',
+                 'pps_allowance_exceeded', 'conntrack_allowance_exceeded')
+  AND s.time > now() - INTERVAL 5 MINUTE
+  AND s.ip4 != 0
+GROUP BY pod_ip
+"""
+    result = {}
+    throttled_count = 0
+    try:
+        data = ch_query_json(sql)
+        for row in data.get('data', []):
+            pod_ip = row.get('pod_ip', '')
+            info = ip_map.get(pod_ip)
+            if not info:
+                continue
+            svc_name = info['name']
+            bw  = float(row.get('bw_exceeded',       0) or 0) > 0
+            pps = float(row.get('pps_exceeded',       0) or 0) > 0
+            ct  = float(row.get('conntrack_exceeded', 0) or 0) > 0
+            if svc_name not in result:
+                result[svc_name] = {
+                    'nfm_bw_throttled':       False,
+                    'nfm_pps_throttled':      False,
+                    'nfm_conntrack_throttled': False,
+                }
+            result[svc_name]['nfm_bw_throttled']       |= bw
+            result[svc_name]['nfm_pps_throttled']      |= pps
+            result[svc_name]['nfm_conntrack_throttled'] |= ct
+            if bw or pps or ct:
+                throttled_count += 1
+        logger.info(f"NFM throttling: {throttled_count} throttled pod(s) across {len(result)} service(s)")
+    except Exception as e:
+        logger.error(f"fetch_nfm_throttling failed: {e}")
+    return result
+
+
 def fetch_active_connections() -> dict:
     """从 network_map.1m 查 TCP 连接数（用 syn_count 代理活跃连接）"""
     sql = """
@@ -486,7 +536,7 @@ def batch_upsert_edges(edges: list):
 def batch_fetch_dependency_and_update(service_names: list, l7_metrics: dict,
                                        ip_map_by_name: dict, replica_counts: dict,
                                        resource_limits: dict, active_connections_map: dict,
-                                       restart_map: dict):
+                                       restart_map: dict, nfm_throttling: dict = None):
     """合并 dependency 查询：每个服务 1 次请求（原来 4 次）+ 1 次 metrics 更新"""
     ts = int(time.time())
     for name in service_names:
@@ -552,6 +602,14 @@ def batch_fetch_dependency_and_update(service_names: list, l7_metrics: dict,
             props.append(f".property(single,'{key}',{int(dep.get(key, -1))})")
         for key in ['is_entry_point', 'has_db_dependency', 'has_cache_dependency']:
             props.append(f".property(single,'{key}',{'true' if dep.get(key) else 'false'})")
+        # NFM 限速标志（来自 prometheus.samples，三个 bool 属性）
+        throttling = (nfm_throttling or {}).get(name, {})
+        bw  = throttling.get('nfm_bw_throttled',       False)
+        pps = throttling.get('nfm_pps_throttled',      False)
+        ct  = throttling.get('nfm_conntrack_throttled', False)
+        props.append(f".property(single,'nfm_bw_throttled',{'true' if bw else 'false'})")
+        props.append(f".property(single,'nfm_pps_throttled',{'true' if pps else 'false'})")
+        props.append(f".property(single,'nfm_conntrack_throttled',{'true' if ct else 'false'})")
 
         try:
             neptune_query(f"g.V().has('Microservice','name','{n}'){''.join(props)}")
@@ -695,12 +753,15 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
     replica_counts = fetch_replica_counts(ip_map)
     resource_limits = fetch_resource_limits(ip_map)
 
+    # 7b. NFM 限速指标（bw / pps / conntrack throttling）
+    nfm_throttling = fetch_nfm_throttling(ip_map)
+
     # 8. 合并 dependency 查询 + metrics 更新（每服务 2 次请求，原来 5 次）
     service_names = list(nodes_set.keys())
     logger.info(f"更新 {len(service_names)} 个服务的指标...")
     batch_fetch_dependency_and_update(service_names, l7_metrics, ip_map_by_name,
                                        replica_counts, resource_limits, active_connections_map,
-                                       restart_map)
+                                       restart_map, nfm_throttling)
 
     # 9. 验证
     try:
