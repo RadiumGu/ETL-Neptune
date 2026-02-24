@@ -1290,6 +1290,7 @@ def run_etl():
             'az': inst['az'],
             'private_ip': inst['private_ip'],
             'recovery_priority': priority,
+            'health_status': 'healthy',
         }, inst['managed_by'])
         inst_vid_map[inst['id']] = inst_vid
         stats['vertices'] += 1
@@ -1344,6 +1345,7 @@ def run_etl():
             'dns': lb['dns'],
             'scheme': lb['scheme'],
             'lb_type': lb['type'],
+            'health_status': 'healthy',
         }, lb['managed_by'])
         stats['vertices'] += 1
         # ALB → AZ: LocatedIn（ALB 可以跨多个 AZ）
@@ -1388,6 +1390,7 @@ def run_etl():
             'arn': fn['arn'],
             'runtime': fn['runtime'],
             'recovery_priority': priority,
+            'health_status': 'healthy',
         }, fn['managed_by'])
         fn_vid_map[fn['name']] = fn_vid
         stats['vertices'] += 1
@@ -1544,6 +1547,7 @@ def run_etl():
             'arn': q['arn'],
             'url': q['url'],
             'is_dlq': q['is_dlq'],
+            'health_status': 'healthy',
         }, q['managed_by'])
         sqs_vid_map[q['name']] = q_vid
         sqs_arn_to_name[q['arn']] = q['name']
@@ -1566,6 +1570,32 @@ def run_etl():
                     'source': 'aws-etl', 'evidence': f'env:{var_name}'
                 })
                 stats['edges'] += 1
+
+    # Step 9b: TriggeredBy 边 —— Lambda ← SQS event source mapping
+    try:
+        esm_paginator = lambda_client.get_paginator('list_event_source_mappings')
+        for page in esm_paginator.paginate():
+            for mapping in page.get('EventSourceMappings', []):
+                fn_name = mapping.get('FunctionArn', '').split(':')[-1]  # 取函数名（最后段）
+                src_arn = mapping.get('EventSourceArn', '')
+                esm_state = mapping.get('State', '')
+                # 只处理 SQS event source
+                if ':sqs:' not in src_arn.lower():
+                    continue
+                # SQS ARN → queue name（ARN 末段）
+                q_name = src_arn.split(':')[-1]
+                if fn_name in fn_vid_map and q_name in sqs_vid_map:
+                    upsert_edge(sqs_vid_map[q_name], fn_vid_map[fn_name],
+                                'TriggeredBy', {
+                                    'source': 'aws-etl',
+                                    'call_type': 'async',
+                                    'esm_state': esm_state,
+                                })
+                    stats['edges'] += 1
+                    logger.debug(f"TriggeredBy: {q_name} → {fn_name}")
+        logger.info(f"TriggeredBy edges: {stats['edges']} 条 SQS→Lambda event source 边")
+    except Exception as e:
+        logger.warning(f"TriggeredBy edges failed (non-fatal): {e}")
 
     # =========================================================
     # Step 10: SNS（NEW）
@@ -1823,6 +1853,51 @@ def run_etl():
             logger.info("GC 完成: 无幽灵节点")
     except Exception as e:
         logger.error(f"GC step failed (non-fatal): {e}", exc_info=True)
+
+    # =========================================================
+    # Step 16: CloudWatch Alarms → health_status
+    #   ALARM 状态的资源标记 health_status=degraded；
+    #   每次 ETL 开始时各节点已重置为 health_status=healthy，
+    #   只有本步骤才能将其改为 degraded
+    # =========================================================
+    try:
+        # 支持的维度 → Neptune label + name 字段的映射
+        DIM_TO_LABEL = {
+            'InstanceId':           ('EC2Instance', 'instance_id'),
+            'FunctionName':         ('LambdaFunction', 'name'),
+            'QueueName':            ('SQSQueue', 'name'),
+            'DBInstanceIdentifier': ('RDSInstance', 'id'),
+            'LoadBalancer':         ('LoadBalancer', 'arn_suffix'),  # ALB uses partial ARN
+        }
+        alarm_pager = cw_client.get_paginator('describe_alarms')
+        degraded_count = 0
+        for page in alarm_pager.paginate(StateValue='ALARM'):
+            for alarm in page.get('MetricAlarms', []):
+                for dim in alarm.get('Dimensions', []):
+                    name_key = dim.get('Name', '')
+                    val = dim.get('Value', '')
+                    if name_key not in DIM_TO_LABEL or not val:
+                        continue
+                    label, prop = DIM_TO_LABEL[name_key]
+                    vids = neptune_query(
+                        f"g.V().hasLabel('{label}').has('{prop}','{safe_str(val)}').id()"
+                    ).get('result', {}).get('data', {}).get('@value', [])
+                    if vids:
+                        vid = vids[0]
+                        vid = vid.get('@value', vid) if isinstance(vid, dict) else vid
+                        alarm_n = safe_str(alarm.get('AlarmName', ''))
+                        neptune_query(
+                            f"g.V('{vid}').property(single,'health_status','degraded')"
+                            f".property(single,'alarm_name','{alarm_n}')"
+                        )
+                        degraded_count += 1
+                    break  # 一条告警处理第一个有效维度
+        if degraded_count:
+            logger.info(f"health_status=degraded: {degraded_count} 个节点（CloudWatch ALARM）")
+        else:
+            logger.info("health_status: 所有节点均 healthy（无活跃 ALARM）")
+    except Exception as e:
+        logger.warning(f"CW Alarm health_status failed (non-fatal): {e}")
 
     logger.info(f"=== neptune-etl-from-aws 完成: {stats} ===")
     return stats

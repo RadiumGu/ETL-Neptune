@@ -236,16 +236,18 @@ def _get_eks_k8s_session() -> tuple:
         return None, None, None
 
 def build_ip_service_map() -> tuple:
-    """返回 (ip_map, ecr_dep_map)
-    ip_map:     {pod_ip: {'name':..., 'namespace':..., 'type':..., 'az':...}}
-    ecr_dep_map:{svc_name: set(ecr_repo_names)}  ← 启动依赖
+    """返回 (ip_map, ecr_dep_map, restart_map)
+    ip_map:      {pod_ip: {'name':..., 'namespace':..., 'type':..., 'az':...}}
+    ecr_dep_map: {svc_name: set(ecr_repo_names)}  ← 启动依赖
+    restart_map: {svc_name: max_restart_count}     ← 重启次数（各容器最大值）
     """
     ip_map = {}
     ecr_dep_map = {}
+    restart_map = {}
     import requests
     k8s_endpoint, token, ca_file = _get_eks_k8s_session()
     if not k8s_endpoint:
-        return ip_map, ecr_dep_map
+        return ip_map, ecr_dep_map, restart_map
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
     try:
         # Step 1: node_name → AZ 映射
@@ -308,13 +310,18 @@ def build_ip_service_map() -> tuple:
                         if ecr_suffix in image:
                             repo = image.split(ecr_suffix)[-1].split(':')[0].split('@')[0]
                             ecr_dep_map.setdefault(svc_name, set()).add(repo)
+                # pod 重启次数：取所有容器 restartCount 的最大值
+                if svc_name:
+                    ctr_statuses = item.get('status', {}).get('containerStatuses', [])
+                    max_restart = max((cs.get('restartCount', 0) for cs in ctr_statuses), default=0)
+                    restart_map[svc_name] = max(restart_map.get(svc_name, 0), max_restart)
         logger.info(f"IP→Service map: {len(ip_map)} entries (with AZ info)")
     finally:
         try:
             os.unlink(ca_file)
         except Exception:
             pass
-    return ip_map, ecr_dep_map
+    return ip_map, ecr_dep_map, restart_map
 
 def fetch_resource_limits(ip_map: dict) -> dict:
     """从 K8s Deployments API 获取 resource limits，返回 {svc_name: {cpu, memory}}"""
@@ -332,13 +339,21 @@ def fetch_resource_limits(ip_map: dict) -> dict:
                 labels = item.get('metadata', {}).get('labels', {})
                 svc_name = (labels.get('app') or labels.get('app.kubernetes.io/name')
                             or labels.get('name') or item.get('metadata', {}).get('name', ''))
+                svc_name = K8S_SERVICE_ALIAS.get(svc_name, svc_name)  # 统一别名
                 containers = (item.get('spec', {}).get('template', {})
                               .get('spec', {}).get('containers', []))
                 if containers and svc_name:
                     limits = containers[0].get('resources', {}).get('limits', {})
+                    # 取 Progressing condition 的 lastUpdateTime 作为 last_deploy_time
+                    conditions = item.get('status', {}).get('conditions', [])
+                    last_update = next(
+                        (c.get('lastUpdateTime', '') for c in conditions if c.get('type') == 'Progressing'),
+                        ''
+                    )
                     resource_limits[svc_name] = {
                         'cpu': limits.get('cpu', ''),
                         'memory': limits.get('memory', ''),
+                        'last_deploy_time': last_update,
                     }
         logger.info(f"resource_limits fetched for {len(resource_limits)} services")
     except Exception as e:
@@ -459,6 +474,7 @@ def batch_upsert_edges(edges: list):
             f".property('p99_latency_ms',{p99:.4f})"
             f".property('error_count',{errors})"
             f".property('error_rate',{error_rate})"
+            f".property('call_type','sync')"
             f".property('active',true)"
             f".property('last_seen',{ts})"
         )
@@ -469,7 +485,8 @@ def batch_upsert_edges(edges: list):
 
 def batch_fetch_dependency_and_update(service_names: list, l7_metrics: dict,
                                        ip_map_by_name: dict, replica_counts: dict,
-                                       resource_limits: dict, active_connections_map: dict):
+                                       resource_limits: dict, active_connections_map: dict,
+                                       restart_map: dict):
     """合并 dependency 查询：每个服务 1 次请求（原来 4 次）+ 1 次 metrics 更新"""
     ts = int(time.time())
     for name in service_names:
@@ -526,6 +543,11 @@ def batch_fetch_dependency_and_update(service_names: list, l7_metrics: dict,
         if limits.get('memory'):
             mem_s = safe_str(limits['memory'])
             props.append(f".property(single,'resource_limit_memory','{mem_s}')")
+        # 变更锚点：最近部署时间 + pod 重启次数
+        if limits.get('last_deploy_time'):
+            props.append(f".property(single,'last_deploy_time','{safe_str(limits['last_deploy_time'])}')")
+        restart_count = restart_map.get(name, 0)
+        props.append(f".property(single,'pod_restart_count',{restart_count})")
         for key in ['upstream_count', 'downstream_count']:
             props.append(f".property(single,'{key}',{int(dep.get(key, -1))})")
         for key in ['is_entry_point', 'has_db_dependency', 'has_cache_dependency']:
@@ -543,7 +565,7 @@ def run_etl():
     t0 = time.time()
 
     # 1. 构建 IP→服务名映射
-    ip_map, ecr_dep_map = build_ip_service_map()
+    ip_map, ecr_dep_map, restart_map = build_ip_service_map()
     if not ip_map:
         logger.warning("Empty IP map, will use IP-based names as fallback")
 
@@ -668,7 +690,8 @@ ORDER BY calls DESC LIMIT 100 FORMAT TSV
     service_names = list(nodes_set.keys())
     logger.info(f"更新 {len(service_names)} 个服务的指标...")
     batch_fetch_dependency_and_update(service_names, l7_metrics, ip_map_by_name,
-                                       replica_counts, resource_limits, active_connections_map)
+                                       replica_counts, resource_limits, active_connections_map,
+                                       restart_map)
 
     # 9. 验证
     try:
