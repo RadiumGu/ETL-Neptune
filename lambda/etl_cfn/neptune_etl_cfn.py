@@ -344,17 +344,29 @@ def write_deps_to_neptune(deps: list, stack_name: str) -> int:
         src_label = TYPE_TO_LABEL.get(src_type, src_type.split('::')[-1])
         dst_label = TYPE_TO_LABEL.get(dst_type, dst_type.split('::')[-1])
 
+        def normalize_name(rtype: str, physical_id: str) -> str:
+            """将 CFN 物理 ID 转换为与 etl_aws 一致的节点名字
+            StepFunction ARN → 状态机短名（和 etl_aws list_state_machines 返回值一致）
+            其他类型（Lambda 等）物理 ID 本身就是节点名，直接返回
+            """
+            if rtype == 'AWS::StepFunctions::StateMachine' and ':stateMachine:' in physical_id:
+                return physical_id.split(':stateMachine:')[-1]
+            return physical_id
+
+        src_name = normalize_name(src_type, dep['src_physical'])
+        dst_name = normalize_name(dst_type, dep['dst_physical'])
+
         try:
-            # get-or-create 顶点
-            src_vid = get_or_create_vertex(src_label, dep['src_physical'], stack_name)
-            dst_vid = get_or_create_vertex(dst_label, dep['dst_physical'], stack_name)
+            # get-or-create 顶点（使用 normalize 后的短名，与 etl_aws 节点自然合并）
+            src_vid = get_or_create_vertex(src_label, src_name, stack_name)
+            dst_vid = get_or_create_vertex(dst_label, dst_name, stack_name)
 
             # upsert 边
             if upsert_cfn_edge(src_vid, dst_vid, dep['rel_type'], stack_name, dep['evidence']):
                 count += 1
                 logger.debug(
-                    f"  [{stack_name}] {dep['src_physical']} -[{dep['rel_type']}]-> "
-                    f"{dep['dst_physical']} (evidence={dep['evidence']})"
+                    f"  [{stack_name}] {src_name} -[{dep['rel_type']}]-> "
+                    f"{dst_name} (evidence={dep['evidence']})"
                 )
         except Exception as e:
             logger.error(f"Failed to write dep {dep['src_physical']}->{dep['dst_physical']}: {e}")
