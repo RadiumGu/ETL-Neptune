@@ -377,6 +377,7 @@ def collect_ec2_instances(ec2_client) -> list:
                     'private_ip': inst.get('PrivateIpAddress', ''),
                     'private_dns': inst.get('PrivateDnsName', ''),
                     'subnet_id': inst.get('SubnetId', ''),
+                    'vpc_id': inst.get('VpcId', ''),
                     'managed_by': managed_by,
                     'is_eks_node': is_eks_node,
                     'environment': rtags['environment'],
@@ -984,6 +985,105 @@ def fetch_lambda_cloudwatch_metrics_batch(cw_client, fns: list) -> dict:
         }
     return out
 
+def fetch_nfm_ec2_metrics(cw_client) -> dict:
+    """
+    查询 CloudWatch AWS/NetworkFlowMonitor 指标（monitor 级聚合），
+    返回 {monitor_arn: {'net_rtt_avg_ms', 'net_retransmissions', 'net_health_score', 'net_timeouts'}}
+    """
+    import datetime
+    result = {}
+    try:
+        nfm = boto3.client('networkflowmonitor', region_name=REGION)
+        monitors = nfm.list_monitors().get('monitors', [])
+        for m in monitors:
+            monitor_arn = m.get('monitorArn', '')
+            monitor_name = m.get('monitorName', '')
+            if not monitor_arn:
+                continue
+            dims = [{'Name': 'MonitorId', 'Value': monitor_arn}]
+            end = datetime.datetime.utcnow()
+            start = end - datetime.timedelta(minutes=5)
+
+            def _get_stat(metric_name, stat):
+                try:
+                    r = cw_client.get_metric_statistics(
+                        Namespace='AWS/NetworkFlowMonitor',
+                        MetricName=metric_name,
+                        Dimensions=dims,
+                        StartTime=start,
+                        EndTime=end,
+                        Period=300,
+                        Statistics=[stat],
+                    )
+                    pts = sorted(r.get('Datapoints', []), key=lambda x: x['Timestamp'], reverse=True)
+                    return pts[0][stat] if pts else -1.0
+                except Exception:
+                    return -1.0
+
+            rtt_avg     = _get_stat('RoundTripTime', 'Average')
+            retrans     = _get_stat('Retransmissions', 'Sum')
+            health      = _get_stat('HealthIndicator', 'Average')
+            timeouts    = _get_stat('Timeouts', 'Sum')
+
+            result[monitor_arn] = {
+                'net_rtt_avg_ms':    rtt_avg,
+                'net_retransmissions': retrans,
+                'net_health_score':  health,
+                'net_timeouts':      timeouts,
+                'monitor_name':      monitor_name,
+            }
+            logger.info(f"NFM monitor {monitor_name}: rtt={rtt_avg:.1f}ms retrans={retrans} health={health}")
+    except Exception as e:
+        logger.warning(f"fetch_nfm_ec2_metrics failed (non-fatal): {e}")
+    return result
+
+
+def map_nfm_metrics_to_ec2(nfm_metrics: dict, ec2_instances: list) -> dict:
+    """
+    把 monitor-level NFM 指标映射到 EC2 实例。
+    策略：monitor 的 local-resources 指定了 VPC，VPC 内所有 EC2 都继承同一 monitor 的指标。
+    返回 {ec2_instance_name: metrics_dict}
+    """
+    if not nfm_metrics:
+        return {}
+    ec2_nfm = {}
+    try:
+        nfm = boto3.client('networkflowmonitor', region_name=REGION)
+        for monitor_arn, metrics in nfm_metrics.items():
+            monitor_name = metrics.get('monitor_name', '')
+            if not monitor_name:
+                continue
+            try:
+                detail = nfm.get_monitor(monitorName=monitor_name)
+                local_resources = detail.get('localResources', [])
+                # local-resources 是 VPC ARN 列表，例如：arn:aws:ec2:...:vpc/vpc-xxx
+                vpc_ids = {r.get('identifier', '').split('/')[-1]
+                           for r in local_resources if 'vpc' in r.get('identifier', '')}
+            except Exception:
+                vpc_ids = set()
+            for inst in ec2_instances:
+                if inst.get('vpc_id') in vpc_ids or not vpc_ids:
+                    ec2_nfm[inst['name']] = {k: v for k, v in metrics.items()
+                                              if k != 'monitor_name'}
+    except Exception as e:
+        logger.warning(f"map_nfm_metrics_to_ec2 failed (non-fatal): {e}")
+    return ec2_nfm
+
+
+def update_ec2_nfm_metrics(name: str, metrics: dict):
+    """写入 EC2 节点的 NFM 聚合网络指标（来自 CloudWatch AWS/NetworkFlowMonitor）"""
+    try:
+        n = safe_str(name)
+        ts = int(time.time())
+        props = f".property(single,'nfm_updated_at',{ts})"
+        for key in ['net_rtt_avg_ms', 'net_retransmissions', 'net_health_score', 'net_timeouts']:
+            v = float(metrics.get(key, -1.0))
+            props += f".property(single,'{key}',{v:.4f})"
+        neptune_query(f"g.V().has('EC2Instance', 'name', '{n}'){props}")
+    except Exception as e:
+        logger.error(f"update_ec2_nfm_metrics {name}: {e}")
+
+
 def update_ec2_metrics(name, metrics):
     try:
         n = safe_str(name)
@@ -1389,6 +1489,14 @@ def run_etl():
                 stats['cw_ec2'] += 1
         except Exception as e:
             logger.warning(f"EC2 CW metrics {inst['name']}: {e}")
+
+    # EC2 NFM 网络指标（来自 CloudWatch AWS/NetworkFlowMonitor，monitor 级聚合 RTT）
+    nfm_cw = fetch_nfm_ec2_metrics(cw_client)
+    if nfm_cw:
+        ec2_nfm_map = map_nfm_metrics_to_ec2(nfm_cw, ec2_instances)
+        for ec2_name, nfm_metrics in ec2_nfm_map.items():
+            update_ec2_nfm_metrics(ec2_name, nfm_metrics)
+        logger.info(f"NFM metrics written to {len(ec2_nfm_map)} EC2 nodes")
 
     # =========================================================
     # Step 3: EKS 集群
