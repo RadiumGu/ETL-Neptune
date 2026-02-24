@@ -60,7 +60,8 @@ TYPE_TO_LABEL = {
     'AWS::DynamoDB::Table': 'DynamoDBTable',
     'AWS::SQS::Queue': 'Queue',
     'AWS::ElasticLoadBalancingV2::LoadBalancer': 'LoadBalancer',
-    'AWS::ElasticLoadBalancingV2::TargetGroup': 'Microservice',
+    # TargetGroup 不单独建节点（是 ALB 内部路由细节，不是业务拓扑节点）
+    # 'AWS::ElasticLoadBalancingV2::TargetGroup': 'Microservice',  # 已移除：TG ≠ Microservice
     'AWS::ApiGateway::RestApi': 'APIGateway',
     'AWS::SNS::Topic': 'SNSTopic',
     'AWS::Kinesis::Stream': 'KinesisStream',
@@ -327,21 +328,10 @@ def extract_declared_deps(template: dict, physical_map: dict) -> list:
                     })
 
         # ── ALB ListenerRule → TargetGroup ──
+        # TargetGroup 是 ALB 内部路由细节，不作为独立节点纳入拓扑图，跳过此边
+        # 如需追踪 ListenerRule→微服务 的关系，需要从 EKS TargetGroupBinding 推导（待实现）
         if rtype == 'AWS::ElasticLoadBalancingV2::ListenerRule':
-            for action in props.get('Actions', []):
-                tg_arn_ref = action.get('TargetGroupArn')
-                target_logical = extract_ref_or_getatt(tg_arn_ref) if tg_arn_ref else None
-                if target_logical and target_logical in tg_logicals:
-                    dst_phys = physical_map.get(target_logical, {})
-                    if dst_phys.get('physical_id'):
-                        deps.append({
-                            'src_physical': src_physical,
-                            'src_type': rtype,
-                            'dst_physical': dst_phys['physical_id'],
-                            'dst_type': 'AWS::ElasticLoadBalancingV2::TargetGroup',
-                            'rel_type': 'RoutesTo',
-                            'evidence': 'alb:listener_rule:action',
-                        })
+            pass  # skip TargetGroup edges
 
     return deps
 
